@@ -527,13 +527,16 @@ def _paged_attention_decode_batched_kernel(
     # Meta scalars
     scale,
     group_size: tl.constexpr,   # num_q_heads // num_kv_heads
-    BLOCK_SIZE: tl.constexpr,   # tokens per block
-    HEAD_DIM: tl.constexpr,     # channels per head
+    BLOCK_SIZE: tl.constexpr,   # cache block size in physical pool (e.g. 16)
+    HEAD_DIM: tl.constexpr,     # channels per head (e.g. 64)
+    TILE_SIZE: tl.constexpr,    # tokens processed per iteration (e.g. 16 or 64)
 ):
     """
     Batched Kernel: 2D Grid = (num_seqs, num_q_heads).
     Each program computes attention for one (seq_idx, q_head_idx) pair.
     Online single-pass softmax across that sequence's logical blocks.
+    Supports TILE_SIZE multiples of BLOCK_SIZE (e.g. TILE_SIZE=64 across 16-token blocks)
+    for reduced loop trip overhead on large sequences.
     """
     seq_idx = tl.program_id(0)
     q_head_idx = tl.program_id(1)
@@ -541,10 +544,10 @@ def _paged_attention_decode_batched_kernel(
 
     # Load this sequence's actual token count
     seq_len = tl.load(seq_lens_ptr + seq_idx)
-    num_blocks_for_seq = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+    num_tiles = (seq_len + TILE_SIZE - 1) // TILE_SIZE
 
     d_offsets = tl.arange(0, HEAD_DIM)
-    tok_offsets = tl.arange(0, BLOCK_SIZE)
+    tile_tok_offsets = tl.arange(0, TILE_SIZE)
 
     # Pointer to Q for this sequence and query head: q[seq_idx, q_head_idx, :]
     q_ptrs = (
@@ -563,27 +566,30 @@ def _paged_attention_decode_batched_kernel(
     # Base pointer for this sequence's row in the block table
     seq_bt_ptr = block_tables_ptr + seq_idx * stride_bts
 
-    for b_idx in range(num_blocks_for_seq):
-        physical_block_id = tl.load(seq_bt_ptr + b_idx * stride_btb)
-
-        # 1. Pointer arithmetic for K cache [BLOCK_SIZE, HEAD_DIM]
-        k_base_ptrs = (
-            k_cache_ptr
-            + physical_block_id * stride_kb
-            + kv_head_idx * stride_kh
-        )
-        k_ptrs = (
-            k_base_ptrs
-            + tok_offsets[:, None] * stride_kt
-            + d_offsets[None, :] * stride_kd
-        )
-        token_indices = b_idx * BLOCK_SIZE + tok_offsets
+    for tile_idx in range(num_tiles):
+        token_indices = tile_idx * TILE_SIZE + tile_tok_offsets
         token_mask = token_indices < seq_len
 
-        k_block = tl.load(k_ptrs, mask=token_mask[:, None], other=0.0)
+        logical_block_indices = token_indices // BLOCK_SIZE
+        offsets_in_block = token_indices % BLOCK_SIZE
+
+        phys_ptrs = seq_bt_ptr + logical_block_indices * stride_btb
+        max_blocks = (seq_len + BLOCK_SIZE - 1) // BLOCK_SIZE
+        valid_block_mask = (logical_block_indices < max_blocks) & token_mask
+        phys_ids = tl.load(phys_ptrs, mask=valid_block_mask, other=0)
+
+        # 1. Pointer arithmetic for K cache [TILE_SIZE, HEAD_DIM]
+        k_ptrs = (
+            k_cache_ptr
+            + phys_ids[:, None] * stride_kb
+            + offsets_in_block[:, None] * stride_kt
+            + kv_head_idx * stride_kh
+            + d_offsets[None, :] * stride_kd
+        )
+        k_tile = tl.load(k_ptrs, mask=token_mask[:, None], other=0.0)
 
         # 2. Compute unnormalized scores
-        scores = tl.sum(q[None, :] * k_block, axis=1) * scale
+        scores = tl.sum(q[None, :] * k_tile, axis=1) * scale
         scores = tl.where(token_mask, scores, -float("inf"))
 
         # 3. New running maximum and rescaling factor
@@ -598,21 +604,18 @@ def _paged_attention_decode_batched_kernel(
         # 5. Update running denominator
         l_new = l_prev * alpha + tl.sum(p, axis=0)
 
-        # 6. Pointer arithmetic for V cache [BLOCK_SIZE, HEAD_DIM]
-        v_base_ptrs = (
-            v_cache_ptr
-            + physical_block_id * stride_vb
-            + kv_head_idx * stride_vh
-        )
+        # 6. Pointer arithmetic for V cache [TILE_SIZE, HEAD_DIM]
         v_ptrs = (
-            v_base_ptrs
-            + tok_offsets[:, None] * stride_vt
+            v_cache_ptr
+            + phys_ids[:, None] * stride_vb
+            + offsets_in_block[:, None] * stride_vt
+            + kv_head_idx * stride_vh
             + d_offsets[None, :] * stride_vd
         )
-        v_block = tl.load(v_ptrs, mask=token_mask[:, None], other=0.0)
+        v_tile = tl.load(v_ptrs, mask=token_mask[:, None], other=0.0)
 
         # 7. Rescale and accumulate value vectors
-        acc = acc * alpha + tl.sum(p[:, None] * v_block, axis=0)
+        acc = acc * alpha + tl.sum(p[:, None] * v_tile, axis=0)
 
         m_prev = m_new
         l_prev = l_new
@@ -640,6 +643,7 @@ def paged_attention_decode_batched(
     Batched Triton decode paged-attention for multiple sequences simultaneously.
     Grid = (num_seqs, num_q_heads).
     Supports GQA and variable sequence lengths.
+    Selects optimal tile size and warp count based on batch size and sequence length.
     """
     assert q.is_cuda and k_cache.is_cuda and v_cache.is_cuda
     assert block_tables.is_cuda and seq_lens.is_cuda
@@ -657,6 +661,16 @@ def paged_attention_decode_batched(
 
     group_size = num_q_heads // num_kv_heads
     out = torch.empty_like(q)
+
+    # Adaptive config promotion:
+    # Large workloads (num_seqs >= 16) benefit from TILE_SIZE=64 and 8 warps.
+    # Small workloads (num_seqs < 16) minimize launch floor overhead with TILE_SIZE=16 and 4 warps.
+    if num_seqs >= 16:
+        tile_size = 64
+        num_warps = 8
+    else:
+        tile_size = 16
+        num_warps = 4
 
     grid = (num_seqs, num_q_heads)
     _paged_attention_decode_batched_kernel[grid](
@@ -677,5 +691,8 @@ def paged_attention_decode_batched(
         group_size=group_size,
         BLOCK_SIZE=block_size,
         HEAD_DIM=head_dim,
+        TILE_SIZE=tile_size,
+        num_warps=num_warps,
+        num_stages=2,
     )
     return out

@@ -51,9 +51,11 @@ class PagedAttentionContext:
         else:
             self.is_batched = True
             self.block_table_list = block_tables
-            padded_bt, seq_lens_t = pad_block_tables(block_tables, seq_lens, device=pool.device)
-            self.padded_block_tables = padded_bt
-            self.seq_lens_tensor = seq_lens_t
+            self.padded_block_tables = pad_block_tables(block_tables, device=pool.device)
+            if isinstance(seq_lens, torch.Tensor):
+                self.seq_lens_tensor = seq_lens.to(device=pool.device, dtype=torch.int32)
+            else:
+                self.seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device=pool.device)
 
 
 def paged_decode_attention_forward(
@@ -125,19 +127,19 @@ def paged_decode_attention_forward(
         pool.k_cache[layer_idx][physical_block_id, offset] = k_val
         pool.v_cache[layer_idx][physical_block_id, offset] = v_val
 
-        # 4. Attention kernel: q is [num_q_heads, head_dim]
-        q_2d = query_states.squeeze(0).squeeze(1)  # [num_q_heads, head_dim]
-        attn_output = paged_attention_decode_v2(
-            q=q_2d,
+        # 4. Attention kernel: use promoted autotuned batched kernel
+        # q_3d: [1, num_q_heads, head_dim]
+        q_3d = query_states.squeeze(2)
+        bt_2d = ctx.block_table_tensor.unsqueeze(0)
+        seq_lens_t = torch.tensor([seq_len], dtype=torch.int32, device=pool.device)
+        attn_output = paged_attention_decode_batched(
+            q=q_3d,
             k_cache=pool.k_cache[layer_idx],
             v_cache=pool.v_cache[layer_idx],
-            block_table=ctx.block_table_tensor,
-            seq_len=seq_len,
+            block_tables=bt_2d,
+            seq_lens=seq_lens_t,
             scale=scale,
-        )  # [num_q_heads, head_dim]
-
-        # Reshape to [1, 1, num_q_heads * head_dim]
-        attn_output = attn_output.unsqueeze(0).unsqueeze(0)  # [1, 1, num_q_heads, head_dim]
+        )  # [1, num_q_heads, head_dim]
         attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     else:
         # Batched decode
@@ -218,14 +220,14 @@ class KernelPagedManualDecode:
         model: nn.Module,
         tokenizer: Any,
         block_size: int = 16,
-        num_blocks: int = 1024,
+        num_blocks: Optional[int] = None,
+        gpu_memory_utilization: float = 0.65,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.block_size = block_size
-        self.num_blocks = num_blocks
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
 
@@ -233,6 +235,21 @@ class KernelPagedManualDecode:
         self.num_layers = getattr(config, "num_hidden_layers", 24)
         self.num_kv_heads = getattr(config, "num_key_value_heads", 2)
         self.head_dim = getattr(config, "head_dim", 64)
+
+        if num_blocks is None:
+            if self.device.type == "cuda":
+                from engine.memory.block_allocator import compute_num_blocks
+                self.num_blocks = compute_num_blocks(
+                    model_config=config,
+                    block_size=self.block_size,
+                    gpu_memory_utilization=gpu_memory_utilization,
+                    device=self.device,
+                    dtype=self.dtype,
+                )
+            else:
+                self.num_blocks = 1024
+        else:
+            self.num_blocks = num_blocks
 
         self.pool = PhysicalBlockPool(
             num_blocks=self.num_blocks,
@@ -279,6 +296,201 @@ class KernelPagedManualDecode:
                 self.pool.v_cache[layer_idx][physical_block_id, offset] = v_tok.squeeze(0).to(self.dtype)
 
     @torch.inference_mode()
+    def prefill(
+        self,
+        seq: Any,
+        allocator: Optional[BlockAllocator] = None,
+    ) -> int:
+        """
+        Single-sequence prefill step via standard HuggingFace forward.
+        Copies the full K/V into freshly allocated blocks in the physical pool.
+
+        Args:
+            seq: Sequence or dict/object with attributes or keys:
+                 prompt / prompt_token_ids, block_table, etc.
+            allocator: Block allocator to use (defaults to self.allocator).
+
+        Returns:
+            first_token: The first generated token ID (argmax of prefill logits).
+        """
+        alloc = allocator or self.allocator
+
+        # 1. Resolve prompt tokens
+        if hasattr(seq, "prompt_token_ids") and seq.prompt_token_ids:
+            input_ids = torch.tensor([seq.prompt_token_ids], dtype=torch.long, device=self.device)
+        elif hasattr(seq, "prompt") and seq.prompt:
+            enc = self.tokenizer(seq.prompt, return_tensors="pt").to(self.device)
+            input_ids = enc.input_ids
+            if hasattr(seq, "prompt_token_ids") and not seq.prompt_token_ids:
+                seq.prompt_token_ids = input_ids[0].tolist()
+        elif isinstance(seq, dict) and "prompt_token_ids" in seq and seq["prompt_token_ids"]:
+            input_ids = torch.tensor([seq["prompt_token_ids"]], dtype=torch.long, device=self.device)
+        elif isinstance(seq, dict) and "prompt" in seq and seq["prompt"]:
+            enc = self.tokenizer(seq["prompt"], return_tensors="pt").to(self.device)
+            input_ids = enc.input_ids
+        else:
+            raise ValueError(f"Unable to extract prompt or prompt_token_ids from sequence: {seq}")
+
+        prompt_len = input_ids.shape[1]
+
+        # 2. Resolve block table
+        if hasattr(seq, "block_table") and seq.block_table is not None:
+            block_table = seq.block_table
+        elif isinstance(seq, dict) and seq.get("block_table") is not None:
+            block_table = seq["block_table"]
+        else:
+            seq_id = getattr(seq, "seq_id", 0) if not isinstance(seq, dict) else seq.get("seq_id", 0)
+            block_table = BlockTable(seq_id=seq_id, block_size=self.block_size)
+            if hasattr(seq, "block_table"):
+                seq.block_table = block_table
+            elif isinstance(seq, dict):
+                seq["block_table"] = block_table
+
+        # 3. HF prefill forward pass
+        prefill_out = self.model(input_ids=input_ids, use_cache=True)
+        pkv = prefill_out.past_key_values
+        self._copy_prefill_kv(pkv, block_table, prompt_len, alloc)
+
+        logits = prefill_out.logits[:, -1, :]
+        next_token_id = int(torch.argmax(logits, dim=-1).item())
+
+        # Store logits for diagnostics.
+        if hasattr(seq, "last_logits"):
+            seq.last_logits = logits[0].detach().cpu()
+        elif isinstance(seq, dict):
+            seq["last_logits"] = logits[0].detach().cpu()
+
+        # Set cur_len = prompt_len here because:
+        # (a) Only the runner knows the true tokenized length (scheduler doesn't tokenize).
+        # (b) post_step does NOT increment cur_len for prefill — the first generated
+        #     token is the input_ids for the first decode step; it is not yet in the
+        #     KV cache, so cur_len must equal bt.num_tokens == prompt_len.
+        if hasattr(seq, "cur_len"):
+            seq.cur_len = prompt_len
+        elif isinstance(seq, dict):
+            seq["cur_len"] = prompt_len
+
+        # Do NOT set last_token_id or append to generated_ids here.
+        # Those are the exclusive responsibility of Scheduler.post_step().
+        return next_token_id
+
+    @torch.inference_mode()
+    def decode_step(
+        self,
+        seqs: List[Any],
+        allocator: Optional[BlockAllocator] = None,
+    ) -> List[int]:
+        """
+        Batched decode step for N running sequences.
+
+        Args:
+            seqs: List of running sequences. Each sequence must provide:
+                  - block_table (BlockTable)
+                  - current length (cur_len or num_tokens or len(prompt) + len(generated))
+                  - last_token_id (or generated_ids[-1])
+            allocator: Block allocator to use (defaults to self.allocator).
+
+        Returns:
+            next_tokens: List of newly generated token IDs of length N.
+        """
+        N = len(seqs)
+        if N == 0:
+            return []
+
+        alloc = allocator or self.allocator
+
+        # 1. Advance allocation and record current lengths & last tokens
+        seq_lens_list: List[int] = []
+        block_tables: List[BlockTable] = []
+        last_tokens: List[int] = []
+
+        for seq in seqs:
+            # Extract block table
+            if hasattr(seq, "block_table"):
+                bt = seq.block_table
+            elif isinstance(seq, dict):
+                bt = seq["block_table"]
+            else:
+                raise ValueError("Sequence must provide a block_table attribute or dict key.")
+
+            # bt.num_tokens is the authoritative KV-cache occupancy. It was set
+            # to prompt_len by _copy_prefill_kv and is bumped by 1 on each decode
+            # step below. seq.cur_len mirrors bt.num_tokens but is only updated
+            # by post_step AFTER we return, so we must read bt.num_tokens here.
+            cur_len = bt.num_tokens  # tokens already in KV cache
+
+            # The new token will be written at KV position cur_len (0-indexed).
+            new_len = cur_len + 1
+            # The Scheduler pre-allocates a new block when cur_len % block_size == 0
+            # (before calling decode_step). We only allocate here as a fallback for
+            # standalone usage (generate() or tests that bypass the scheduler).
+            if not bt.last_block_has_space():
+                if alloc is not None:
+                    new_block_id = alloc.allocate()
+                    bt.physical_block_ids.append(new_block_id)
+                else:
+                    raise RuntimeError(
+                        f"Block table for seq has no space at KV position {cur_len} "
+                        f"and no allocator was provided."
+                    )
+            bt.num_tokens = new_len
+
+            seq_lens_list.append(new_len)
+            block_tables.append(bt)
+
+            # The input token for this decode step is the last generated token.
+            if hasattr(seq, "last_token_id") and seq.last_token_id is not None:
+                last_tok = seq.last_token_id
+            elif hasattr(seq, "generated_ids") and seq.generated_ids:
+                last_tok = seq.generated_ids[-1]
+            elif isinstance(seq, dict) and "last_token_id" in seq:
+                last_tok = seq["last_token_id"]
+            else:
+                raise ValueError("Sequence must provide last_token_id or non-empty generated_ids.")
+            last_tokens.append(last_tok)
+
+        # 2. Build input_ids [N, 1] and per-sequence rotary position_ids [N, 1]
+        # Position id for each sequence is its 0-indexed position: new_len - 1
+        input_ids = torch.tensor(last_tokens, dtype=torch.long, device=self.device).unsqueeze(1)  # [N, 1]
+        position_ids = torch.tensor(
+            [[s_len - 1] for s_len in seq_lens_list],
+            dtype=torch.long,
+            device=self.device,
+        )  # [N, 1]
+
+        # 3. Setup batched PagedAttentionContext
+        ctx = PagedAttentionContext(
+            pool=self.pool,
+            block_tables=block_tables,
+            seq_lens=seq_lens_list,
+            block_size=self.block_size,
+            is_decode=True,
+        )
+
+        # 4. Model forward pass with patched paged attention
+        with patch_paged_attention(self.model, ctx):
+            step_out = self.model(
+                input_ids=input_ids,
+                position_ids=position_ids,
+                use_cache=False,
+            )
+
+        step_logits = step_out.logits[:, -1, :]  # [N, vocab_size]
+        next_tokens_tensor = torch.argmax(step_logits, dim=-1)  # [N]
+        next_tokens = next_tokens_tensor.tolist()
+
+        # 5. Store per-sequence logits for diagnostics only.
+        #    Do NOT mutate generated_ids / cur_len / last_token_id — that is
+        #    Scheduler.post_step()'s exclusive job.
+        for i, seq in enumerate(seqs):
+            if hasattr(seq, "last_logits"):
+                seq.last_logits = step_logits[i].detach().cpu()
+            elif isinstance(seq, dict):
+                seq["last_logits"] = step_logits[i].detach().cpu()
+
+        return next_tokens
+
+    @torch.inference_mode()
     def generate(
         self,
         prompt: str,
@@ -289,6 +501,7 @@ class KernelPagedManualDecode:
     ) -> Union[List[int], Tuple[List[int], List[torch.Tensor]]]:
         """
         Autoregressive generation using Triton paged attention kernel in decode steps.
+        Maintains backward compatibility for single-sequence generation.
         """
         alloc = allocator or self.allocator
 
@@ -297,7 +510,7 @@ class KernelPagedManualDecode:
         input_ids = enc.input_ids
         batch_size, prompt_len = input_ids.shape
         if batch_size != 1:
-            raise ValueError("KernelPagedManualDecode currently supports single-sequence decode (batch_size=1).")
+            raise ValueError("KernelPagedManualDecode generate() currently supports single-sequence prompt.")
 
         if block_table is None:
             block_table = BlockTable(seq_id=0, block_size=self.block_size)
@@ -311,27 +524,24 @@ class KernelPagedManualDecode:
         generated = [next_token.item()]
         logits_history: List[torch.Tensor] = [prefill_out.logits[:, -1, :]]
 
-        # 3. Decode loop
+        # 3. Decode loop using batched decode step under the hood
         seq_len = prompt_len
 
         for step in range(1, max_new_tokens):
-            # Advance sequence length to include current position
             seq_len += 1
             if not block_table.last_block_has_space():
                 new_block_id = alloc.allocate()
                 block_table.physical_block_ids.append(new_block_id)
             block_table.num_tokens += 1
 
-            # Prepare PagedAttentionContext for this decode step
             ctx = PagedAttentionContext(
                 pool=self.pool,
-                block_tables=block_table,
-                seq_lens=seq_len,
+                block_tables=[block_table],
+                seq_lens=[seq_len],
                 block_size=self.block_size,
                 is_decode=True,
             )
 
-            # Position id for current decode token is seq_len - 1
             cur_pos_id = torch.tensor([[seq_len - 1]], dtype=torch.long, device=self.device)
 
             with patch_paged_attention(self.model, ctx):

@@ -204,3 +204,9 @@ class BlockTable:
         if not self.physical_block_ids:
             return False
         return self.num_tokens % self.block_size != 0
+
+    def free(self, allocator: BlockAllocator) -> None:
+        """Release all physical blocks held by this sequence back to the allocator."""
+        for b_id in self.physical_block_ids:
+            allocator.free(b_id)
+        self.physical_block_ids.clear()
