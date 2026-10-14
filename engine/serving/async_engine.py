@@ -231,10 +231,12 @@ class AsyncEngine:
         queue: asyncio.Queue = asyncio.Queue()
         self._output_queues[seq_id] = queue
 
+        finished = False
         try:
             while True:
                 item = await queue.get()
                 if isinstance(item, _StopTokenSentinel):
+                    finished = True
                     break
                 if isinstance(item, Exception):
                     raise item
@@ -245,4 +247,7 @@ class AsyncEngine:
                 self._aborted_seq_ids.add(seq_id)
             raise
         finally:
+            if not finished:
+                async with self._lock:
+                    self._aborted_seq_ids.add(seq_id)
             self._output_queues.pop(seq_id, None)

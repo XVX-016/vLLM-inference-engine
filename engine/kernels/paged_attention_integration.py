@@ -267,24 +267,20 @@ class KernelPagedManualDecode:
         pkv: Any,
         block_table: BlockTable,
         prompt_len: int,
-        alloc: BlockAllocator,
     ) -> None:
         """
-        Allocates blocks for the prefill tokens and copies prefill K/V
-        into the PhysicalBlockPool.
+        Copies prefill K/V tensors into the PhysicalBlockPool.
+
+        The scheduler has already allocated physical blocks and set
+        block_table.num_tokens = prompt_len before calling prefill().
+        This method ONLY writes tensor data — it never calls allocate().
         """
         for t in range(prompt_len):
-            if not block_table.last_block_has_space():
-                new_block_id = alloc.allocate()
-                block_table.physical_block_ids.append(new_block_id)
-            block_table.num_tokens += 1
-
             logical_block_idx = t // self.block_size
             physical_block_id = block_table.physical_block_ids[logical_block_idx]
             offset = t % self.block_size
 
             for layer_idx in range(self.num_layers):
-                # HF DynamicCache or tuple format
                 if hasattr(pkv, "layers"):
                     k_tok = pkv.layers[layer_idx].keys[:, :, t, :]  # [1, num_kv_heads, head_dim]
                     v_tok = pkv.layers[layer_idx].values[:, :, t, :]
@@ -303,18 +299,20 @@ class KernelPagedManualDecode:
     ) -> int:
         """
         Single-sequence prefill step via standard HuggingFace forward.
-        Copies the full K/V into freshly allocated blocks in the physical pool.
+        Copies the full K/V into the physical blocks that the Scheduler
+        already allocated and stored in seq.block_table.
+
+        CONTRACT: The scheduler has already allocated seq.block_table.physical_block_ids
+        and set seq.block_table.num_tokens = prompt_len before calling this.
+        This method MUST NOT call allocator.allocate() or mutate num_tokens.
 
         Args:
-            seq: Sequence or dict/object with attributes or keys:
-                 prompt / prompt_token_ids, block_table, etc.
-            allocator: Block allocator to use (defaults to self.allocator).
+            seq: Sequence object with block_table already populated by the scheduler.
+            allocator: Ignored (kept for API compatibility only).
 
         Returns:
             first_token: The first generated token ID (argmax of prefill logits).
         """
-        alloc = allocator or self.allocator
-
         # 1. Resolve prompt tokens
         if hasattr(seq, "prompt_token_ids") and seq.prompt_token_ids:
             input_ids = torch.tensor([seq.prompt_token_ids], dtype=torch.long, device=self.device)
@@ -333,23 +331,23 @@ class KernelPagedManualDecode:
 
         prompt_len = input_ids.shape[1]
 
-        # 2. Resolve block table
+        # 2. Resolve block table (must already be set by the scheduler)
         if hasattr(seq, "block_table") and seq.block_table is not None:
             block_table = seq.block_table
         elif isinstance(seq, dict) and seq.get("block_table") is not None:
             block_table = seq["block_table"]
         else:
-            seq_id = getattr(seq, "seq_id", 0) if not isinstance(seq, dict) else seq.get("seq_id", 0)
-            block_table = BlockTable(seq_id=seq_id, block_size=self.block_size)
-            if hasattr(seq, "block_table"):
-                seq.block_table = block_table
-            elif isinstance(seq, dict):
-                seq["block_table"] = block_table
+            raise RuntimeError(
+                "prefill() requires seq.block_table to be pre-populated by the scheduler. "
+                "The scheduler must call step() before prefill()."
+            )
 
         # 3. HF prefill forward pass
         prefill_out = self.model(input_ids=input_ids, use_cache=True)
         pkv = prefill_out.past_key_values
-        self._copy_prefill_kv(pkv, block_table, prompt_len, alloc)
+
+        # Write K/V data into already-allocated blocks (no allocation here).
+        self._copy_prefill_kv(pkv, block_table, prompt_len)
 
         logits = prefill_out.logits[:, -1, :]
         next_token_id = int(torch.argmax(logits, dim=-1).item())
@@ -360,18 +358,10 @@ class KernelPagedManualDecode:
         elif isinstance(seq, dict):
             seq["last_logits"] = logits[0].detach().cpu()
 
-        # Set cur_len = prompt_len here because:
-        # (a) Only the runner knows the true tokenized length (scheduler doesn't tokenize).
-        # (b) post_step does NOT increment cur_len for prefill — the first generated
-        #     token is the input_ids for the first decode step; it is not yet in the
-        #     KV cache, so cur_len must equal bt.num_tokens == prompt_len.
-        if hasattr(seq, "cur_len"):
-            seq.cur_len = prompt_len
-        elif isinstance(seq, dict):
-            seq["cur_len"] = prompt_len
-
         # Do NOT set last_token_id or append to generated_ids here.
         # Those are the exclusive responsibility of Scheduler.post_step().
+        # Do NOT modify cur_len or block_table.num_tokens here.
+        # step() already set num_tokens = prompt_len; post_step() will mirror cur_len.
         return next_token_id
 
     @torch.inference_mode()
@@ -397,9 +387,13 @@ class KernelPagedManualDecode:
         if N == 0:
             return []
 
-        alloc = allocator or self.allocator
-
-        # 1. Advance allocation and record current lengths & last tokens
+        # 1. Collect current lengths, block tables, and last tokens.
+        #    The Scheduler has already pre-allocated any new block needed for this
+        #    step (in step() at kv_len % block_size == 0 boundaries) and has set
+        #    bt.num_tokens to the current KV occupancy.
+        #    We bump bt.num_tokens += 1 here so the paged attention kernel writes
+        #    the new K/V at position (num_tokens - 1) = old_kv_len, which is the
+        #    correct slot.  post_step() will mirror cur_len but NOT touch num_tokens.
         seq_lens_list: List[int] = []
         block_tables: List[BlockTable] = []
         last_tokens: List[int] = []
@@ -413,27 +407,12 @@ class KernelPagedManualDecode:
             else:
                 raise ValueError("Sequence must provide a block_table attribute or dict key.")
 
-            # bt.num_tokens is the authoritative KV-cache occupancy. It was set
-            # to prompt_len by _copy_prefill_kv and is bumped by 1 on each decode
-            # step below. seq.cur_len mirrors bt.num_tokens but is only updated
-            # by post_step AFTER we return, so we must read bt.num_tokens here.
-            cur_len = bt.num_tokens  # tokens already in KV cache
-
-            # The new token will be written at KV position cur_len (0-indexed).
-            new_len = cur_len + 1
-            # The Scheduler pre-allocates a new block when cur_len % block_size == 0
-            # (before calling decode_step). We only allocate here as a fallback for
-            # standalone usage (generate() or tests that bypass the scheduler).
-            if not bt.last_block_has_space():
-                if alloc is not None:
-                    new_block_id = alloc.allocate()
-                    bt.physical_block_ids.append(new_block_id)
-                else:
-                    raise RuntimeError(
-                        f"Block table for seq has no space at KV position {cur_len} "
-                        f"and no allocator was provided."
-                    )
-            bt.num_tokens = new_len
+            # bt.num_tokens is the authoritative KV occupancy set by step().
+            # Bump it by 1 so the kernel writes at the next available slot.
+            # IMPORTANT: this is the only place num_tokens is incremented for decode;
+            # post_step() mirrors cur_len from it but must NOT increment again.
+            bt.num_tokens += 1
+            new_len = bt.num_tokens  # = old_kv_len + 1
 
             seq_lens_list.append(new_len)
             block_tables.append(bt)
@@ -515,10 +494,16 @@ class KernelPagedManualDecode:
         if block_table is None:
             block_table = BlockTable(seq_id=0, block_size=self.block_size)
 
+        # Allocate prompt blocks for standalone generate() run
+        blocks_needed = math.ceil(prompt_len / self.block_size) if prompt_len > 0 else 0
+        while len(block_table.physical_block_ids) < blocks_needed:
+            block_table.physical_block_ids.append(alloc.allocate())
+        block_table.num_tokens = prompt_len
+
         # 2. Prefill step via HF forward
         prefill_out = self.model(input_ids=input_ids, use_cache=True)
         pkv = prefill_out.past_key_values
-        self._copy_prefill_kv(pkv, block_table, prompt_len, alloc)
+        self._copy_prefill_kv(pkv, block_table, prompt_len)
 
         next_token = torch.argmax(prefill_out.logits[:, -1, :], dim=-1, keepdim=True)
         generated = [next_token.item()]

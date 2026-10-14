@@ -4,14 +4,31 @@ Continuous batching scheduler for LLM inference (Phase 4).
 Implements iteration-level scheduling with waiting and running queues, FCFS admission,
 watermark-based capacity checks, and prefill vs. decode batch separation.
 Includes LIFO preemption with re-prefill for memory exhaustion.
+
+Block-ownership contract
+------------------------
+* step()      - SOLE caller of allocator.allocate().  For prefill: allocates all
+                prompt blocks immediately and sets bt.num_tokens = prompt_len.
+                For decode: allocates one block at each kv_len % block_size == 0.
+* post_step() - SOLE writer of generated_ids / last_token_id / total_generated_tokens.
+                Mirrors cur_len from bt.num_tokens but does NOT increment num_tokens.
+* model runner:
+    prefill()     - writes K/V into already-allocated blocks; must NOT call
+                    allocator.allocate() or change block_table.num_tokens.
+    decode_step() - bumps bt.num_tokens += 1 before the kernel call (so the
+                    kernel knows the write position); must NOT call allocate().
+
+Single source of truth for KV occupancy: block_table.num_tokens.
+seq.cur_len is a mirror kept in sync by post_step().
 """
 from __future__ import annotations
 
 import enum
 import itertools
 import logging
+import math
 from dataclasses import dataclass, field
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Set
 
 from engine.memory.block_allocator import BlockAllocator, BlockTable
 
@@ -38,13 +55,20 @@ class Sequence:
     last_token_id: Optional[int] = None
     num_preemptions: int = 0
     total_generated_tokens: int = 0
+    all_generated_ids: list[int] = field(default_factory=list)
     last_logits: Optional[Any] = None
 
     @property
+    def kv_len(self) -> int:
+        """Authoritative KV-cache token count, derived solely from block_table."""
+        if self.block_table is not None:
+            return self.block_table.num_tokens
+        return self.cur_len
+
+    @property
     def num_tokens(self) -> int:
-        if self.cur_len > 0:
-            return self.cur_len
-        return len(self.prompt_token_ids) + len(self.generated_ids)
+        """Compat alias for kv_len."""
+        return self.kv_len
 
     def is_finished(self, eos_token_id: Optional[int] = None) -> bool:
         if self.total_generated_tokens >= self.max_new_tokens:
@@ -106,12 +130,14 @@ class Scheduler:
         watermark_blocks: int = 1,
         max_batch_size: int = 32,
         eos_token_id: Optional[int] = None,
+        debug_invariants: bool = False,
     ):
         self.block_allocator = block_allocator
         self.block_size = block_size
         self.watermark_blocks = watermark_blocks
         self.max_batch_size = max_batch_size
         self.eos_token_id = eos_token_id
+        self.debug_invariants = debug_invariants
 
         self.waiting: list[Sequence] = []
         self.running: list[Sequence] = []
@@ -134,6 +160,10 @@ class Scheduler:
         )
         self.waiting.append(seq)
         return seq
+
+    def has_unfinished_requests(self) -> bool:
+        """Returns True if there are requests currently waiting, running, or swapped."""
+        return bool(self.waiting or self.running or self.swapped)
 
     def _calc_blocks_needed(self, num_tokens: int) -> int:
         if num_tokens <= 0:
@@ -221,15 +251,19 @@ class Scheduler:
         for seq, tok in zip(batch.sequences, next_tokens):
             seq.last_token_id = tok
             seq.generated_ids.append(tok)
+            seq.all_generated_ids.append(tok)
             seq.total_generated_tokens += 1
 
             if batch.batch_type == BatchType.PREFILL:
-                # cur_len was set to prompt_len by prefill(). KV cache matches. No change.
+                # step() set bt.num_tokens = prompt_len.  The first generated token
+                # is the decode input, not yet in the KV cache — do NOT increment.
+                # Mirror cur_len for any backward-compat code that reads it.
+                seq.cur_len = seq.block_table.num_tokens if seq.block_table else 0
                 seq.status = SeqStatus.RUNNING
                 self.running.append(seq)
             else:
-                # Sync cur_len to the ground-truth KV count kept in the block table.
-                # Using bt.num_tokens avoids drift if any path increments differently.
+                # decode_step() already bumped bt.num_tokens += 1 before the kernel
+                # call.  post_step must NOT increment again — just mirror cur_len.
                 if seq.block_table is not None:
                     seq.cur_len = seq.block_table.num_tokens
                 else:
@@ -240,6 +274,9 @@ class Scheduler:
                 if seq in self.running:
                     self.running.remove(seq)
                 self.free_sequence(seq)
+
+        if self.debug_invariants:
+            self._check_invariants()
 
     def step(self) -> Optional[ScheduledBatch]:
         """
@@ -290,14 +327,20 @@ class Scheduler:
                 if admitted.block_table is None:
                     admitted.block_table = BlockTable(seq_id=admitted.seq_id, block_size=self.block_size)
 
+                # Allocate physical blocks for the full prompt now, so the free-list
+                # correctly reflects consumed capacity before the model forward pass.
+                # This ensures watermark checks and preemption triggers work properly.
+                for _ in range(blocks_for_prompt):
+                    blk = self.block_allocator.allocate()
+                    admitted.block_table.physical_block_ids.append(blk)
+                admitted.block_table.num_tokens = prompt_len
                 admitted.cur_len = prompt_len
 
                 return ScheduledBatch(batch_type=BatchType.PREFILL, sequences=[admitted])
 
         # 3. Decode step for running sequences
         if self.running:
-            # We iterate through running sequences to ensure each has enough blocks.
-            # Using an index-based loop allows handling preemptions dynamically.
+            # Index-based loop so preemptions can be handled dynamically.
             idx = 0
             while idx < len(self.running):
                 seq = self.running[idx]
@@ -305,7 +348,9 @@ class Scheduler:
                     seq.block_table = BlockTable(seq_id=seq.seq_id, block_size=self.block_size)
 
                 bt = seq.block_table
-                needs_block = (seq.cur_len > 0) and (seq.cur_len % self.block_size == 0)
+                # Use bt.num_tokens (authoritative) not seq.cur_len (mirror).
+                kv_len = bt.num_tokens
+                needs_block = (kv_len > 0) and (kv_len % self.block_size == 0)
 
                 if needs_block:
                     while not self.block_allocator.can_allocate(1):
@@ -348,3 +393,48 @@ class Scheduler:
                 return ScheduledBatch(batch_type=BatchType.DECODE, sequences=list(self.running))
 
         return None
+
+    def _check_invariants(self) -> None:
+        """
+        Debug invariant checker (runs when debug_invariants=True after each post_step).
+
+        Invariant 1 — Block coverage:
+            ceil(bt.num_tokens / block_size) == len(bt.physical_block_ids)
+        Invariant 2 — No aliasing:
+            no physical block id appears in more than one sequence's table.
+        Invariant 3 — Conservation:
+            sum(blocks in running tables) + free_blocks == total_blocks
+        """
+        seen_blocks: Set[int] = set()
+        used_blocks = 0
+
+        for seq in self.running:
+            bt = seq.block_table
+            if bt is None:
+                continue
+
+            expected = math.ceil(bt.num_tokens / self.block_size) if bt.num_tokens > 0 else 0
+            actual = len(bt.physical_block_ids)
+            if expected != actual:
+                raise AssertionError(
+                    f"[Invariant 1] seq {seq.seq_id}: bt.num_tokens={bt.num_tokens} -> "
+                    f"expected {expected} blocks, found {actual}."
+                )
+
+            for blk_id in bt.physical_block_ids:
+                if blk_id in seen_blocks:
+                    raise AssertionError(
+                        f"[Invariant 2] Physical block {blk_id} appears in multiple block "
+                        f"tables (second occurrence in seq {seq.seq_id})."
+                    )
+                seen_blocks.add(blk_id)
+                used_blocks += 1
+
+        free_blocks = len(self.block_allocator.free_block_ids)
+        total = self.block_allocator.num_blocks
+        if used_blocks + free_blocks != total:
+            raise AssertionError(
+                f"[Invariant 3] Block conservation: running tables hold {used_blocks}, "
+                f"free={free_blocks}, total={total}. "
+                f"Delta={used_blocks + free_blocks - total} (positive = leaked)."
+            )

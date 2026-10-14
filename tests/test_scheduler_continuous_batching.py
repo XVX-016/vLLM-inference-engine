@@ -43,6 +43,12 @@ class FakeModelEngine:
             else:
                 tok = self.default_token
             tokens.append(tok)
+        # Simulate decode_step's responsibility: bump bt.num_tokens so the
+        # scheduler's boundary check (kv_len % block_size == 0) fires correctly.
+        if batch.batch_type == BatchType.DECODE:
+            for seq in batch.sequences:
+                if seq.block_table is not None:
+                    seq.block_table.num_tokens += 1
         return tokens
 
 
@@ -256,18 +262,31 @@ def test_decode_step_allocates_block_on_boundary():
     # seq prompt has 3 tokens -> 1 block allocated initially
     seq = scheduler.add_request("p", max_new_tokens=3, prompt_token_ids=[1, 2, 3])
 
-    # 1. Prefill: cur_len becomes 3, 1 token generated -> cur_len = 4
+    # 1. Prefill: cur_len becomes 3 (prompt_len), 1 token generated.
+    #    bt.num_tokens == 3 (set by step()). The first generated token is
+    #    the decode input, not yet in the KV cache, so cur_len == 3.
     b_prefill = scheduler.step()
     scheduler.post_step(b_prefill, fake_engine.step(b_prefill))
-    assert seq.cur_len == 4
+    assert seq.cur_len == 3  # prompt_len; first token is decode input, not in KV cache
     assert len(seq.block_table.physical_block_ids) == 1
 
-    # 2. Decode step: seq.cur_len == 4 is a multiple of block_size=4!
-    # Scheduler must allocate a new block for it before running the decode step.
-    b_decode = scheduler.step()
-    assert b_decode.batch_type == BatchType.DECODE
-    assert len(seq.block_table.physical_block_ids) == 2
-    scheduler.post_step(b_decode, fake_engine.step(b_decode))
+    # 2. First decode step: FakeModelEngine bumps bt.num_tokens to 4.
+    #    post_step mirrors cur_len = 4.  Now kv_len == 4 == block_size.
+    b_decode1 = scheduler.step()
+    assert b_decode1.batch_type == BatchType.DECODE
+    # At this point step() sees kv_len==4 for the NEXT step call. But step()
+    # is called for decode1 when kv_len==3 still. The boundary fires when
+    # step() is called for decode2 and sees kv_len==4.
+    fake_engine.step(b_decode1)  # bumps bt.num_tokens to 4
+    scheduler.post_step(b_decode1, [42])
+    assert seq.cur_len == 4  # now kv_len == 4, boundary will fire on next step()
+
+    # 3. Second decode step: step() sees kv_len==4 (boundary!) and allocates new block.
+    b_decode2 = scheduler.step()
+    assert b_decode2.batch_type == BatchType.DECODE
+    assert len(seq.block_table.physical_block_ids) == 2  # new block allocated
+    fake_engine.step(b_decode2)  # bumps bt.num_tokens to 5
+    scheduler.post_step(b_decode2, [42])
     assert seq.cur_len == 5
 
 

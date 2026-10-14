@@ -162,6 +162,14 @@ class BlockAllocator:
     def can_allocate(self, n: int) -> bool:
         return len(self.free_block_ids) >= n
 
+    def get_free_block_count(self) -> int:
+        """Returns the number of unallocated blocks currently in the free list."""
+        return len(self.free_block_ids)
+
+    @property
+    def num_free_blocks(self) -> int:
+        return len(self.free_block_ids)
+
     def allocate(self) -> int:
         if not self.free_block_ids:
             raise MemoryError("No free physical blocks — scheduler should have preempted before calling this.")
