@@ -57,6 +57,7 @@ class Sequence:
     total_generated_tokens: int = 0
     all_generated_ids: list[int] = field(default_factory=list)
     last_logits: Optional[Any] = None
+    ignore_eos: bool = False
 
     @property
     def kv_len(self) -> int:
@@ -73,7 +74,7 @@ class Sequence:
     def is_finished(self, eos_token_id: Optional[int] = None) -> bool:
         if self.total_generated_tokens >= self.max_new_tokens:
             return True
-        if eos_token_id is not None and self.generated_ids and self.generated_ids[-1] == eos_token_id:
+        if not self.ignore_eos and eos_token_id is not None and self.generated_ids and self.generated_ids[-1] == eos_token_id:
             return True
         return False
 
@@ -144,12 +145,14 @@ class Scheduler:
         self.swapped: list[Sequence] = []
         self._id_counter = itertools.count()
         self.preemption_count: int = 0
+        self.admission_blocked_count: int = 0
 
     def add_request(
         self,
         prompt: str,
         max_new_tokens: int,
         prompt_token_ids: Optional[list[int]] = None,
+        ignore_eos: bool = False,
     ) -> Sequence:
         """Enqueues a new generation request into the waiting queue."""
         seq = Sequence(
@@ -157,6 +160,7 @@ class Scheduler:
             prompt=prompt,
             max_new_tokens=max_new_tokens,
             prompt_token_ids=prompt_token_ids if prompt_token_ids is not None else [],
+            ignore_eos=ignore_eos,
         )
         self.waiting.append(seq)
         return seq
@@ -207,8 +211,11 @@ class Scheduler:
         """
         self.preemption_count += 1
         victim.num_preemptions += 1
+        pool_size = self.block_allocator.num_blocks
+        allocated_blocks = pool_size - len(self.block_allocator.free_block_ids)
         logger.info(
             f"Preempting sequence {victim.seq_id} (preemption #{self.preemption_count}). "
+            f"Peak allocated blocks: {allocated_blocks}/{pool_size} (pool size: {pool_size}). "
             f"Generated {len(victim.generated_ids)} tokens so far."
         )
 
@@ -337,6 +344,11 @@ class Scheduler:
                 admitted.cur_len = prompt_len
 
                 return ScheduledBatch(batch_type=BatchType.PREFILL, sequences=[admitted])
+            else:
+                self.admission_blocked_count += 1
+        elif self.waiting:
+            # Waiting queue has requests but running queue reached max_batch_size
+            self.admission_blocked_count += 1
 
         # 3. Decode step for running sequences
         if self.running:

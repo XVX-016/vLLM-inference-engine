@@ -3,6 +3,9 @@ __pycache__/
 .venv/
 .pytest_cache/
 benchmarks/results/*.json
+benchmarks/results/*.png
+benchmarks/results/*.log
+benchmarks/test_trace.json
 !benchmarks/results/.gitkeep
 *.egg-info/
 .DS_Store

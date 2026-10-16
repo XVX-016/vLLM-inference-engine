@@ -66,6 +66,7 @@ class AsyncEngine:
         self.executor = executor or ThreadPoolExecutor(max_workers=1)
         self.run_logger = run_logger
         self._iteration_count: int = 0
+        self.total_tokens_generated: int = 0
 
         # Per-request queues mapping seq_id -> asyncio.Queue[Union[int, _StopTokenSentinel]]
         self._output_queues: Dict[int, asyncio.Queue] = {}
@@ -137,7 +138,27 @@ class AsyncEngine:
                         self._aborted_seq_ids.remove(seq_id)
 
             # 2. Schedule next batch
-            batch = self.scheduler.step()
+            try:
+                batch = self.scheduler.step()
+            except MemoryError as mem_err:
+                # A single sequence exceeded the block pool capacity.
+                # Log it, signal the sequence's output queue with the error,
+                # and continue — do NOT crash the entire engine loop.
+                logger.warning(f"MemoryError in scheduler.step(): {mem_err}")
+                # Find any sequence without an output queue entry and clean up
+                # The scheduler already removed/finished the problematic sequence.
+                # Signal all queues that have no corresponding running/waiting seq.
+                known_seq_ids = (
+                    {s.seq_id for s in self.scheduler.running}
+                    | {s.seq_id for s in self.scheduler.waiting}
+                )
+                orphaned = [sid for sid in list(self._output_queues) if sid not in known_seq_ids]
+                for sid in orphaned:
+                    q = self._output_queues.pop(sid, None)
+                    if q is not None:
+                        await q.put(mem_err)
+                await asyncio.sleep(self.idle_sleep_s)
+                continue
 
             # 3. If idle, sleep briefly
             if batch is None or batch.is_empty:
@@ -163,6 +184,7 @@ class AsyncEngine:
 
             # 5. Route new tokens to client queues and advance scheduler
             self.scheduler.post_step(batch, next_tokens)
+            self.total_tokens_generated += len(next_tokens)
 
             # Log per-iteration metrics
             if self.run_logger is not None:
@@ -203,6 +225,7 @@ class AsyncEngine:
         prompt: str,
         max_tokens: int = 16,
         prompt_token_ids: Optional[List[int]] = None,
+        ignore_eos: bool = False,
     ) -> AsyncGenerator[int, None]:
         """
         Submits a new generation request and returns an async generator yielding
@@ -222,6 +245,7 @@ class AsyncEngine:
             prompt=prompt,
             max_new_tokens=max_tokens,
             prompt_token_ids=prompt_token_ids,
+            ignore_eos=ignore_eos,
         )
         seq_id = seq.seq_id
 
