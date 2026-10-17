@@ -620,12 +620,6 @@ def create_naive_app(engine: Optional[NaiveBatchEngine] = None) -> FastAPI:
                 finish_reason: Optional[str] = None
                 try:
                     async for tok in token_gen:
-                        try:
-                            if await asyncio.wait_for(raw_request.is_disconnected(), timeout=0.0001):
-                                break
-                        except (asyncio.TimeoutError, TimeoutError):
-                            pass
-
                         tok_str = decode_token(tok)
                         accumulated_text += tok_str
 
@@ -669,6 +663,31 @@ def create_naive_app(engine: Optional[NaiveBatchEngine] = None) -> FastAPI:
                         ],
                     }
                     yield f"data: {json.dumps(final_chunk)}\n\n"
+                    yield "data: [DONE]\n\n"
+                except (asyncio.CancelledError, GeneratorExit):
+                    logger.info(f"Stream cancelled for request {req_id}")
+                    raise
+                except Exception as ex:
+                    import traceback
+                    tb = traceback.format_exc()
+                    logger.error(f"Server exception in event_generator for {req_id}:\n{tb}")
+                    err_chunk = {
+                        "id": req_id,
+                        "object": "text_completion",
+                        "created": created_ts,
+                        "model": req.model or "default",
+                        "choices": [
+                            {
+                                "text": "",
+                                "index": 0,
+                                "logprobs": None,
+                                "finish_reason": "error",
+                            }
+                        ],
+                        "error": str(ex),
+                        "traceback": tb,
+                    }
+                    yield f"data: {json.dumps(err_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
                 finally:
                     await token_gen.aclose()

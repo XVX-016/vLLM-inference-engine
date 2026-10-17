@@ -374,6 +374,7 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
                             }
                         ],
                         "error": str(ex),
+                        "traceback": tb,
                     }
                     yield f"data: {json.dumps(err_chunk)}\n\n"
                     yield "data: [DONE]\n\n"

@@ -49,7 +49,7 @@ BYTES_PER_BLOCK = BYTES_PER_TOKEN * BLOCK_SIZE               # 196608
 PORT_NAIVE    = 8251
 PORT_PAGED    = 8252
 RESULTS_DIR   = Path("benchmarks/results")
-SWEEP_LAMBDAS = [0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
+SWEEP_LAMBDAS = [0.25, 0.5, 1.0, 2.0, 4.0, 8.0]
 WARMUP_S      = 30.0    # wall-clock seconds of warmup to exclude from stats
 
 FAST_MODE = os.environ.get("BENCH_FAST", "0") == "1"
@@ -133,8 +133,10 @@ def paged_block_count(budget_bytes: int) -> int:
 
 
 def choose_budget(trace: List[Req], min_slots: int = 3) -> Tuple[float, int, int]:
-    """Return (budget_mib, naive_msl, clamped_slots). naive_msl = max(p+o) in trace."""
-    msl = max(r.prompt_len + r.output_len for r in trace)
+    """Return (budget_mib, naive_msl, clamped_slots). naive_msl accounts for tokenization expansion."""
+    raw_msl = max(r.prompt_len + r.output_len for r in trace)
+    # Tokenizer expands words to ~1.3-1.4x tokens. Set MSL to accommodate tokenized prompt + output.
+    msl = max(192, int(raw_msl * 1.5))
     slot_bytes = msl * BYTES_PER_TOKEN
     budget_bytes = min_slots * slot_bytes
     budget_mib = math.ceil(budget_bytes / (1024 * 1024))
@@ -286,25 +288,55 @@ async def _send_one(
                 r.error = f"HTTP {resp.status}: {await resp.text()}"
                 r.e2e_s = time.perf_counter() - t0
                 return r
+            server_error_encountered: Optional[str] = None
+            buf = ""
             async for raw in resp.content:
-                line = raw.decode("utf-8", errors="replace").strip()
-                if not line.startswith("data: "):
-                    continue
-                if line == "data: [DONE]":
-                    break
-                now = time.perf_counter()
-                if r.ttft_s is None:
-                    r.ttft_s = now - t0
-                try:
-                    chunk = json.loads(line[6:])
-                    choices = chunk.get("choices", [])
-                    if choices and choices[0].get("text"):
-                        r.actual_ol += 1
-                        r.token_timestamps.append(now)
-                except json.JSONDecodeError:
-                    pass
+                buf += raw.decode("utf-8", errors="replace")
+                # Process all complete SSE lines from the accumulated buffer
+                while "\n" in buf:
+                    line, buf = buf.split("\n", 1)
+                    line = line.rstrip("\r")
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str == "[DONE]":
+                        buf = ""  # discard remainder — stream ended
+                        break
+                    now = time.perf_counter()
+                    if r.ttft_s is None:
+                        r.ttft_s = now - t0
+                    try:
+                        chunk = json.loads(data_str)
+                        if "error" in chunk:
+                            err_msg = chunk["error"]
+                            tb_msg = chunk.get("traceback", "")
+                            server_error_encountered = f"Server Error: {err_msg}"
+                            print(f"\n[SERVER ERROR CHUNK] req_id={r.req_id} error={err_msg}\n{tb_msg}")
+                        choices = chunk.get("choices", [])
+                        if choices:
+                            finish_reason = choices[0].get("finish_reason")
+                            if finish_reason == "error":
+                                server_error_encountered = server_error_encountered or "finish_reason=error"
+                            # Count every non-final content chunk as one output token.
+                            # finish_reason is None on real token chunks; 'length'/'stop' on the
+                            # empty terminal chunk.  We count by chunk, not by truthy text, because
+                            # some tokens legitimately decode to whitespace / newline ("").
+                            if finish_reason is None:
+                                r.actual_ol += 1
+                                r.token_timestamps.append(now)
+                    except json.JSONDecodeError:
+                        pass
+
+
         r.e2e_s = time.perf_counter() - t0
-        r.success = True
+        if server_error_encountered:
+            r.success = False
+            r.error = server_error_encountered
+        elif r.actual_ol != req.output_len:
+            r.success = False
+            r.error = f"Token count mismatch: received {r.actual_ol}, expected {req.output_len}"
+        else:
+            r.success = True
     except Exception as ex:
         r.error = str(ex)
         r.e2e_s = time.perf_counter() - t0
@@ -341,6 +373,28 @@ async def _poll_loop(
         await asyncio.sleep(interval)
 
 
+async def _gpu_monitor_loop(stop: asyncio.Event, interval: float = 10.0) -> None:
+    """Requirement 5: Log GPU clock and temperature every 10 s to catch throttling."""
+    while not stop.is_set():
+        try:
+            res = subprocess.run(
+                ["nvidia-smi", "--query-gpu=clocks.current.graphics,temperature.gpu,utilization.gpu", "--format=csv,noheader,nounits"],
+                capture_output=True, text=True, timeout=2.0
+            )
+            if res.returncode == 0:
+                parts = [p.strip() for p in res.stdout.strip().split(",")]
+                if len(parts) >= 3:
+                    clock, temp, util = parts[0], parts[1], parts[2]
+                    print(f"       [GPU Health] Clock={clock} MHz, Temp={temp}°C, Util={util}%")
+        except Exception:
+            pass
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=interval)
+            break
+        except (asyncio.TimeoutError, TimeoutError):
+            pass
+
+
 async def replay(
     base_url: str,
     trace: List[Req],
@@ -359,6 +413,7 @@ async def replay(
     conn = aiohttp.TCPConnector(limit=1000, force_close=False)
     async with aiohttp.ClientSession(connector=conn) as sess:
         poll_task = asyncio.create_task(_poll_loop(sess, metrics_url, samples, stop_evt, 0.1))
+        gpu_task  = asyncio.create_task(_gpu_monitor_loop(stop_evt, 10.0))
 
         tasks: List[asyncio.Task] = []
         t_start = time.perf_counter()
@@ -377,8 +432,10 @@ async def replay(
 
         stop_evt.set()
         await poll_task
+        await gpu_task
 
     return results, samples, wall_dur
+
 
 
 def _pct(vals: List[float], p: float) -> Optional[float]:
@@ -687,14 +744,27 @@ async def run_5c_point(
     seed: int,
     budget_mib: Optional[float] = None,
 ) -> Dict[str, Any]:
-    trace = gen_trace(n_reqs, lam, seed=seed)
     if FAST_MODE:
         warmup_s = 2.0
+        trace = gen_trace(n_reqs, lam, seed=seed)
+    elif lam < 1.0:
+        # Requirement 5: Duration-based window (~240s after warmup) for points below 1 req/s
+        warmup_s = 30.0
+        target_eval_duration = 240.0
+        target_eval_reqs = max(60, int(target_eval_duration * lam))
+        warmup_reqs = max(10, int(warmup_s * lam) + 5)
+        total_reqs = warmup_reqs + target_eval_reqs
+        trace = gen_trace(total_reqs, lam, seed=seed)
+        print(f"         [Duration-based point < 1 req/s] lam={lam}: warmup={warmup_s}s, window={target_eval_duration}s -> {len(trace)} total requests ({target_eval_reqs} post-warmup target)")
     else:
-        span     = trace[-1].arrival_s if trace else 1.0
-        warmup_s = min(WARMUP_S, span * 0.25)
+        warmup_s = WARMUP_S
+        trace = gen_trace(n_reqs, lam, seed=seed)
+
     res, samp, dur = await replay(base_url, trace, warmup_s=warmup_s)
-    return compute_summary(res, samp, dur, lam, budget_mib=budget_mib)
+    summary = compute_summary(res, samp, dur, lam, budget_mib=budget_mib)
+    summary["reported_request_count"] = len(trace)
+    return summary
+
 
 
 async def run_5c_sweep(
@@ -725,8 +795,9 @@ async def run_5c_sweep(
                 s = await run_5c_point(f"http://127.0.0.1:{PORT_NAIVE}", lam, n_reqs, run_seed,
                                        budget_mib=budget_mib)
                 all_res["naive"][lam].append(s)
+                n_cnt = s.get('reported_request_count', n_reqs)
                 print(
-                    f"         Naive -> {s['completed']}/{s['total_eval']} ok  "
+                    f"         Naive -> {s['completed']}/{s['total_eval']} ok (trace={n_cnt})  "
                     f"tps={s['token_tps']}  ttft_p99={s['ttft_p99']}  e2e_p99={s['e2e_p99']}"
                 )
             finally:
@@ -738,11 +809,13 @@ async def run_5c_sweep(
                 s = await run_5c_point(f"http://127.0.0.1:{PORT_PAGED}", lam, n_reqs, run_seed,
                                        budget_mib=budget_mib)
                 all_res["paged"][lam].append(s)
+                p_cnt = s.get('reported_request_count', n_reqs)
                 print(
-                    f"         Paged -> {s['completed']}/{s['total_eval']} ok  "
+                    f"         Paged -> {s['completed']}/{s['total_eval']} ok (trace={p_cnt})  "
                     f"tps={s['token_tps']}  ttft_p99={s['ttft_p99']}  e2e_p99={s['e2e_p99']}"
                     f"  [blocked={s['paged_ever_blocked']}  preempted={s['paged_ever_preempted']}]"
                 )
+
             finally:
                 stop_server(proc_p)
 
