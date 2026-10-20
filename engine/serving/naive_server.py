@@ -16,12 +16,13 @@ import json
 import logging
 import os
 import time
+import traceback
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, AsyncGenerator, Dict, List, Optional, Union
+from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 
 import torch
@@ -56,6 +57,8 @@ class NaiveHFModelRunner:
             self.tokenizer.pad_token = self.tokenizer.eos_token
         self.tokenizer.padding_side = "left"
 
+        self.pad_token_id = self.tokenizer.pad_token_id if self.tokenizer.pad_token_id is not None else 0
+
         self.model = AutoModelForCausalLM.from_pretrained(
             model_name,
             dtype=self.dtype,
@@ -84,6 +87,7 @@ class NaiveHFModelRunner:
         )
         self.decode_times: List[float] = []
 
+    @torch.inference_mode()
     def execute_batch(
         self,
         batch: List[PendingNaiveRequest],
@@ -92,36 +96,71 @@ class NaiveHFModelRunner:
         """
         Executes a batch of requests to completion using left-padded prefill
         and lockstep decode, invoking token_callback(req, token_id, is_last) for each output.
+        Builds padded batches directly from prompt_token_ids without invoking tokenizer.
         """
         if not batch:
             return
 
         B = len(batch)
         pad_count = self.max_slots - B
-        prompts = [r.prompt for r in batch] + [self.tokenizer.pad_token] * pad_count
+        
+        # Build left-padded tensors directly from prompt_token_ids in the runner
+        batch_ids = [r.prompt_token_ids for r in batch]
+        max_prompt_len = max(len(ids) for ids in batch_ids)
 
-        enc = self.tokenizer(prompts, return_tensors="pt", padding=True).to(self.device)
-        if pad_count > 0:
-            enc.attention_mask[-pad_count:, :] = 0
+        input_ids = torch.full((self.max_slots, max_prompt_len), self.pad_token_id, dtype=torch.long, device=self.device)
+        attention_mask = torch.zeros((self.max_slots, max_prompt_len), dtype=torch.long, device=self.device)
+
+        for i, ids in enumerate(batch_ids):
+            cur_len = len(ids)
+            offset = max_prompt_len - cur_len
+            input_ids[i, offset:] = torch.tensor(ids, dtype=torch.long, device=self.device)
+            attention_mask[i, offset:] = 1
 
         # Reset static cache buffers for the new batch
         self.cache.reset()
 
-        # 1. Prefill step
+        # ── runtime grad probe (printed once per process) ───────────────────
+        if not getattr(self, "_grad_probed", False):
+            self._grad_probed = True
+            grad_on = torch.is_grad_enabled()
+            logger.info(
+                "[NaiveRunner] GRAD PROBE: torch.is_grad_enabled()=%s  "
+                "(expected False inside @inference_mode)", grad_on
+            )
+            assert not grad_on, (
+                "execute_batch must run under torch.inference_mode(); "
+                "is_grad_enabled()=True means the decorator is missing!"
+            )
+        # ────────────────────────────────────────────────────────────────────
+
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         out = self.model(
-            input_ids=enc.input_ids,
-            attention_mask=enc.attention_mask,
+            input_ids=input_ids,
+            attention_mask=attention_mask,
             past_key_values=self.cache,
             use_cache=True,
         )
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
 
+        # ── logits.requires_grad probe (printed once) ────────────────────────
+        if not getattr(self, "_logits_probed", False):
+            self._logits_probed = True
+            rg = out.logits.requires_grad
+            logger.info(
+                "[NaiveRunner] LOGITS PROBE: out.logits.requires_grad=%s  "
+                "(expected False inside @inference_mode)", rg
+            )
+            assert not rg, (
+                "out.logits.requires_grad=True — inference_mode not active!"
+            )
+        # ─────────────────────────────────────────────────────────────────────
+
         next_tok = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
         cur_mask = torch.cat(
-            [enc.attention_mask, torch.ones((self.max_slots, 1), dtype=enc.attention_mask.dtype, device=self.device)],
+            [attention_mask, torch.ones((self.max_slots, 1), dtype=attention_mask.dtype, device=self.device)],
             dim=-1,
         )
         if pad_count > 0:
@@ -260,7 +299,9 @@ class NaiveBatchEngine:
         self.waiting_count: int = 0
         self.total_tokens_generated: int = 0
         self.active_tokens_stored: int = 0
+        self.aborted_requests_count: int = 0
         self.preemption_count: int = 0  # Static batching does not preempt mid-batch
+        self.start_time: float = time.time()
 
     def start(self) -> None:
         if not self._is_running:
@@ -284,6 +325,7 @@ class NaiveBatchEngine:
         max_tokens: int,
         prompt_token_ids: Optional[List[int]] = None,
         ignore_eos: bool = False,
+        disconnect_check: Optional[Callable[[], Any]] = None,
     ) -> AsyncGenerator[int, None]:
         self.start()
         req_id = f"naive-{int(time.time()*1000)}-{id(prompt)}"
@@ -296,6 +338,8 @@ class NaiveBatchEngine:
             ignore_eos=ignore_eos,
             queue=queue,
         )
+        if disconnect_check is not None:
+            pending.disconnect_check = disconnect_check
         await self._pending_queue.put(pending)
 
         finished = False
@@ -310,10 +354,13 @@ class NaiveBatchEngine:
                 yield item
         except (asyncio.CancelledError, GeneratorExit):
             pending.aborted = True
+            self.aborted_requests_count += 1
             raise
         finally:
             if not finished:
-                pending.aborted = True
+                if not pending.aborted:
+                    pending.aborted = True
+                    self.aborted_requests_count += 1
 
     async def _batching_loop(self) -> None:
         """
@@ -346,8 +393,26 @@ class NaiveBatchEngine:
                 except asyncio.TimeoutError:
                     break
 
-            # Filter out requests aborted while in queue
-            active_batch = [r for r in current_batch if not r.aborted]
+            # Filter out requests aborted or disconnected while waiting in queue
+            active_batch: List[PendingNaiveRequest] = []
+            for r in current_batch:
+                if r.aborted:
+                    continue
+                # Check if client disconnected while waiting in queue
+                if hasattr(r, "disconnect_check") and callable(r.disconnect_check):
+                    try:
+                        disc = r.disconnect_check()
+                        if asyncio.iscoroutine(disc):
+                            disc = await asyncio.wait_for(disc, timeout=0.001)
+                        if disc:
+                            r.aborted = True
+                            self.aborted_requests_count += 1
+                            logger.info(f"Dropped queued request {r.request_id}: client disconnected.")
+                            continue
+                    except Exception:
+                        pass
+                active_batch.append(r)
+
             if not active_batch:
                 continue
 
@@ -551,6 +616,16 @@ def create_naive_app(engine: Optional[NaiveBatchEngine] = None) -> FastAPI:
         allocated_kv_bytes = eng.total_slots * eng.slot_bytes  # slots * max_seq_len * bytes_per_token
         preallocation_mode = "preallocated_slots"  # static preallocation: derived slots x max_seq_len
 
+        # GPU device memory stats
+        mem_alloc_mb = 0.0
+        mem_res_mb = 0.0
+        if torch.cuda.is_available():
+            mem_alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+            mem_res_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+
+        elapsed = max(0.001, time.time() - getattr(eng, "start_time", time.time()))
+        tokens_per_sec = eng.total_tokens_generated / elapsed
+
         return {
             "running": eng.running_count,
             "waiting": eng.waiting_count,
@@ -567,7 +642,36 @@ def create_naive_app(engine: Optional[NaiveBatchEngine] = None) -> FastAPI:
             "tokens_stored": eng.active_tokens_stored,
             "preemptions": 0,
             "tokens_generated": eng.total_tokens_generated,
+            "tokens_per_second": tokens_per_sec,
+            "aborted_requests": getattr(eng, "aborted_requests_count", 0),
+            "memory_allocated": mem_alloc_mb,
+            "memory_reserved": mem_res_mb,
+            "memory_allocated_mb": mem_alloc_mb,
+            "memory_reserved_mb": mem_res_mb,
         }
+
+    @app.middleware("http")
+    async def catch_exceptions_middleware(request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as exc:
+            req_id = request.headers.get("x-request-id", f"req-{int(time.time()*1000)}-{id(request)}")
+            tb = traceback.format_exc()
+            logger.error(
+                f"[500 CATCH-ALL] Request ID: {req_id} | Path: {request.url.path} | "
+                f"Exception: {type(exc).__name__}: {exc}\nFull Traceback:\n{tb}"
+            )
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "message": f"Internal server error: {type(exc).__name__}: {exc}",
+                        "type": "internal_server_error",
+                        "request_id": req_id,
+                        "traceback": tb,
+                    }
+                },
+            )
 
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest, raw_request: Request):
@@ -606,6 +710,7 @@ def create_naive_app(engine: Optional[NaiveBatchEngine] = None) -> FastAPI:
             max_tokens=max_tokens,
             prompt_token_ids=prompt_token_ids,
             ignore_eos=bool(req.ignore_eos),
+            disconnect_check=raw_request.is_disconnected,
         )
 
         def decode_token(tok_id: int) -> str:
@@ -620,6 +725,12 @@ def create_naive_app(engine: Optional[NaiveBatchEngine] = None) -> FastAPI:
                 finish_reason: Optional[str] = None
                 try:
                     async for tok in token_gen:
+                        try:
+                            if await asyncio.wait_for(raw_request.is_disconnected(), timeout=0.0001):
+                                break
+                        except (asyncio.TimeoutError, TimeoutError):
+                            pass
+
                         tok_str = decode_token(tok)
                         accumulated_text += tok_str
 
@@ -663,31 +774,6 @@ def create_naive_app(engine: Optional[NaiveBatchEngine] = None) -> FastAPI:
                         ],
                     }
                     yield f"data: {json.dumps(final_chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-                except (asyncio.CancelledError, GeneratorExit):
-                    logger.info(f"Stream cancelled for request {req_id}")
-                    raise
-                except Exception as ex:
-                    import traceback
-                    tb = traceback.format_exc()
-                    logger.error(f"Server exception in event_generator for {req_id}:\n{tb}")
-                    err_chunk = {
-                        "id": req_id,
-                        "object": "text_completion",
-                        "created": created_ts,
-                        "model": req.model or "default",
-                        "choices": [
-                            {
-                                "text": "",
-                                "index": 0,
-                                "logprobs": None,
-                                "finish_reason": "error",
-                            }
-                        ],
-                        "error": str(ex),
-                        "traceback": tb,
-                    }
-                    yield f"data: {json.dumps(err_chunk)}\n\n"
                     yield "data: [DONE]\n\n"
                 finally:
                     await token_gen.aclose()

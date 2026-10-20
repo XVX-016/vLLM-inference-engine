@@ -66,7 +66,11 @@ class AsyncEngine:
         self.executor = executor or ThreadPoolExecutor(max_workers=1)
         self.run_logger = run_logger
         self._iteration_count: int = 0
+        self.total_iterations: int = 0
+        self.prefill_iterations: int = 0
         self.total_tokens_generated: int = 0
+        self.aborted_requests_count: int = 0
+        self.start_time: float = asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else time.time()
 
         # Per-request queues mapping seq_id -> asyncio.Queue[Union[int, _StopTokenSentinel]]
         self._output_queues: Dict[int, asyncio.Queue] = {}
@@ -132,6 +136,7 @@ class AsyncEngine:
                     to_remove = list(self._aborted_seq_ids)
                     for seq_id in to_remove:
                         self.scheduler.abort_sequence(seq_id)
+                        self.aborted_requests_count += 1
                         queue = self._output_queues.pop(seq_id, None)
                         if queue is not None:
                             await queue.put(_StopTokenSentinel())
@@ -185,6 +190,9 @@ class AsyncEngine:
             # 5. Route new tokens to client queues and advance scheduler
             self.scheduler.post_step(batch, next_tokens)
             self.total_tokens_generated += len(next_tokens)
+            self.total_iterations += 1
+            if batch.batch_type == BatchType.PREFILL:
+                self.prefill_iterations += 1
 
             # Log per-iteration metrics
             if self.run_logger is not None:

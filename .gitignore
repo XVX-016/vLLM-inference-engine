@@ -6,6 +6,8 @@ benchmarks/results/*.json
 benchmarks/results/*.png
 benchmarks/results/*.log
 benchmarks/test_trace.json
+*.log
+*trace*.json
 !benchmarks/results/.gitkeep
 *.egg-info/
 .DS_Store

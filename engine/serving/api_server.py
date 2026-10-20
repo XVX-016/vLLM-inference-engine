@@ -17,12 +17,15 @@ import logging
 import math
 import os
 import time
+import traceback
 from contextlib import asynccontextmanager
 from typing import Any, AsyncGenerator, Dict, List, Optional, Union
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
+
+import torch
 
 from engine.memory.block_allocator import BlockAllocator
 from engine.scheduler.continuous_batching import Scheduler
@@ -94,6 +97,8 @@ def build_default_engine(
 
     block_size = int(os.environ.get("VLLM_BLOCK_SIZE", str(block_size)))
     watermark_blocks = int(os.environ.get("VLLM_WATERMARK_BLOCKS", str(watermark_blocks)))
+    max_batch_size_env = os.environ.get("VLLM_MAX_BATCH_SIZE")
+    max_batch_size = int(max_batch_size_env) if max_batch_size_env is not None else 32
 
     if num_blocks is not None:
         total_blocks = int(num_blocks)
@@ -107,6 +112,7 @@ def build_default_engine(
         block_allocator=allocator,
         block_size=block_size,
         watermark_blocks=watermark_blocks,
+        max_batch_size=max_batch_size,
     )
     if runner is None:
         logger.info(f"Loading KernelPagedManualDecode on GPU with {total_blocks} blocks...")
@@ -203,6 +209,16 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
         active_token_kv_bytes = tokens_stored * bytes_per_token
         total_kv_bytes = allocator.num_blocks * bytes_per_block
 
+        # GPU device memory stats
+        mem_alloc_mb = 0.0
+        mem_res_mb = 0.0
+        if torch.cuda.is_available():
+            mem_alloc_mb = torch.cuda.memory_allocated() / (1024 * 1024)
+            mem_res_mb = torch.cuda.memory_reserved() / (1024 * 1024)
+
+        elapsed = max(0.001, time.time() - getattr(eng, "start_time", time.time()))
+        tokens_per_sec = eng.total_tokens_generated / elapsed
+
         return {
             "running": len(eng.scheduler.running),
             "waiting": len(eng.scheduler.waiting),
@@ -219,7 +235,39 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
             "preemptions": eng.scheduler.preemption_count,
             "admission_blocked": eng.scheduler.admission_blocked_count,
             "tokens_generated": eng.total_tokens_generated,
+            "tokens_per_second": tokens_per_sec,
+            "aborted_requests": getattr(eng, "aborted_requests_count", 0),
+            "total_iterations": getattr(eng, "total_iterations", 0),
+            "prefill_iterations": getattr(eng, "prefill_iterations", 0),
+            "prefill_fraction": (getattr(eng, "prefill_iterations", 0) / max(1, getattr(eng, "total_iterations", 0))),
+            "memory_allocated": mem_alloc_mb,
+            "memory_reserved": mem_res_mb,
+            "memory_allocated_mb": mem_alloc_mb,
+            "memory_reserved_mb": mem_res_mb,
         }
+
+    @app.middleware("http")
+    async def catch_exceptions_middleware(request: Request, call_next):
+        try:
+            return await call_next(request)
+        except Exception as exc:
+            req_id = request.headers.get("x-request-id", f"req-{int(time.time()*1000)}-{id(request)}")
+            tb = traceback.format_exc()
+            logger.error(
+                f"[500 CATCH-ALL] Request ID: {req_id} | Path: {request.url.path} | "
+                f"Exception: {type(exc).__name__}: {exc}\nFull Traceback:\n{tb}"
+            )
+            return JSONResponse(
+                status_code=500,
+                content={
+                    "error": {
+                        "message": f"Internal server error: {type(exc).__name__}: {exc}",
+                        "type": "internal_server_error",
+                        "request_id": req_id,
+                        "traceback": tb,
+                    }
+                },
+            )
 
     @app.post("/v1/completions")
     async def completions(req: CompletionRequest, raw_request: Request):

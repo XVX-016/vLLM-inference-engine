@@ -497,18 +497,34 @@ def compute_summary(
     else:
         mean_ms_per_tok = None
 
-    # Incomplete request list (for diagnostics)
+    # Incomplete request list and failure-reason histogram (Requirement 2)
     failed_eval = [r for r in eval_res if not r.success]
+    failure_histogram: Dict[str, int] = {}
+    for r in failed_eval:
+        err = r.error or "Unknown error"
+        if "HTTP" in err:
+            key = err.split(":")[0].strip()
+        elif "Timeout" in err or "timeout" in err:
+            key = "Timeout"
+        elif "Token count mismatch" in err:
+            key = "Token count mismatch"
+        elif "Server Error" in err:
+            key = f"Server Exception: {err[:60]}"
+        else:
+            key = f"Exception: {err[:60]}"
+        failure_histogram[key] = failure_histogram.get(key, 0) + 1
 
     return {
         "offered_lam":          lam,
         "completed":            len(good),
         "failed_eval":          len(failed_eval),
+        "failed_histogram":     failure_histogram,
         "failed_req_ids":       [r.req_id for r in failed_eval],
         "failed_errors":        [r.error[:120] if r.error else "" for r in failed_eval],
         "total_eval":           len(eval_res),
         "warmup":               len(warmup_res),
         "duration_s":           round(dur_eval, 3),
+
         "token_tps":            tps,
         "req_tps":              round(len(good) / max(dur_eval, 1e-6), 3),
         "mean_ms_per_token":    mean_ms_per_tok,

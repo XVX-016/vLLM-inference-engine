@@ -387,7 +387,21 @@ class KernelPagedManualDecode:
         if N == 0:
             return []
 
-        # 1. Collect current lengths, block tables, and last tokens.
+        # ── runtime grad probe (printed once per process) ────────────────────
+        if not getattr(self, "_grad_probed", False):
+            self._grad_probed = True
+            grad_on = torch.is_grad_enabled()
+            import logging as _log
+            _log.getLogger(__name__).info(
+                "[PagedRunner] GRAD PROBE decode_step: torch.is_grad_enabled()=%s  "
+                "(expected False inside @inference_mode)", grad_on
+            )
+            assert not grad_on, (
+                "decode_step must run under torch.inference_mode(); "
+                "is_grad_enabled()=True means the decorator is missing!"
+            )
+        # ────────────────────────────────────────────────────────────────────
+
         #    The Scheduler has already pre-allocated any new block needed for this
         #    step (in step() at kv_len % block_size == 0 boundaries) and has set
         #    bt.num_tokens to the current KV occupancy.
