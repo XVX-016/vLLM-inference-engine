@@ -19,8 +19,10 @@ import httpx
 import pytest
 
 from benchmarks.workload_trace import (
+    generate_shared_prefix_trace,
     generate_workload_trace,
     load_trace_from_json,
+    save_shared_prefix_trace,
     save_trace_to_json,
 )
 from engine.serving.api_server import (
@@ -56,6 +58,38 @@ def test_workload_trace_generation_and_determinism(tmp_path: Path):
     loaded = load_trace_from_json(json_path)
     assert len(loaded) == 30
     assert loaded[0].prompt == trace1[0].prompt
+
+
+def test_shared_prefix_trace_uses_tokenizer_measured_lengths_and_serializes(tmp_path: Path):
+    class CharacterTokenizer:
+        def encode(self, text, add_special_tokens=True):
+            return [ord(char) for char in text]
+
+        def decode(self, token_ids, **kwargs):
+            return "".join(chr(token_id) for token_id in token_ids)
+
+    trace = generate_shared_prefix_trace(
+        tokenizer=CharacterTokenizer(),
+        num_requests=12,
+        arrival_rate=2.0,
+        prefix_count=3,
+        system_prompt_tokens=64,
+        seed=91,
+        block_size=16,
+    )
+    assert len(trace.requests) == 12
+    assert all(request.ignore_eos for request in trace.requests)
+    assert all(
+        request.prompt_len == len(CharacterTokenizer().encode(request.prompt))
+        for request in trace.requests
+    )
+    assert trace.metadata["theoretical_shareable_fraction"] > 0
+
+    path = tmp_path / "shared_trace.json"
+    save_shared_prefix_trace(trace, path)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert data["metadata"]["prefix_count"] == 3
+    assert len(data["requests"]) == 12
 
 
 def test_kv_memory_budget_derivation():

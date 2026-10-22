@@ -391,3 +391,162 @@ def test_single_sequence_exceeds_pool_fails():
     # Verify no leaked blocks
     assert len(allocator.free_block_ids) == total_blocks
 
+
+def test_prefix_cache_shares_blocks_and_recomputes_a_prompt_token():
+    allocator = BlockAllocator(num_blocks=8, enable_prefix_cache=True)
+    scheduler = Scheduler(
+        block_allocator=allocator,
+        block_size=2,
+        watermark_blocks=1,
+        debug_invariants=True,
+    )
+    fake_engine = FakeModelEngine()
+    prompt_ids = [10, 11, 12, 13, 14, 15]
+
+    first = scheduler.add_request("first", max_new_tokens=3, prompt_token_ids=prompt_ids)
+    first_batch = scheduler.step()
+    scheduler.post_step(first_batch, fake_engine.step(first_batch))
+    first_blocks = list(first.block_table.physical_block_ids)
+
+    second = scheduler.add_request("second", max_new_tokens=3, prompt_token_ids=prompt_ids)
+    second_batch = scheduler.step()
+    assert second_batch.batch_type == BatchType.PREFILL
+    assert second.num_cached_tokens == 4
+    assert second.block_table.physical_block_ids[:2] == first_blocks[:2]
+    assert second.block_table.physical_block_ids[2] != first_blocks[2]
+    scheduler.post_step(second_batch, fake_engine.step(second_batch))
+    assert allocator.ref_counts[first_blocks[0]] == 2
+    assert allocator.ref_counts[first_blocks[1]] == 2
+    scheduler._check_invariants()
+
+
+def test_prefix_cache_hit_leaves_exactly_one_prompt_token_to_recompute():
+    allocator = BlockAllocator(num_blocks=4, enable_prefix_cache=True)
+    scheduler = Scheduler(
+        block_allocator=allocator,
+        block_size=2,
+        watermark_blocks=0,
+        prefix_mode="full",
+    )
+    fake_engine = FakeModelEngine()
+
+    seed = scheduler.add_request("seed", max_new_tokens=1, prompt_token_ids=[1, 2])
+    seed_batch = scheduler.step()
+    scheduler.post_step(seed_batch, fake_engine.step(seed_batch))
+    assert seed.status == SeqStatus.FINISHED
+
+    target = scheduler.add_request("target", max_new_tokens=1, prompt_token_ids=[1, 2, 3])
+    target_batch = scheduler.step()
+    assert target_batch.batch_type == BatchType.PREFILL
+    assert target.num_cached_tokens == 2
+    assert target.block_table.num_tokens - target.num_cached_tokens == 1
+    scheduler.post_step(target_batch, fake_engine.step(target_batch))
+
+    assert allocator.ref_counts == {}
+    assert allocator.num_available() == allocator.num_blocks
+
+
+def test_finished_prompt_stays_cached_and_is_reused():
+    allocator = BlockAllocator(num_blocks=6, enable_prefix_cache=True)
+    scheduler = Scheduler(block_allocator=allocator, block_size=2, watermark_blocks=1)
+    fake_engine = FakeModelEngine()
+    prompt_ids = [20, 21, 22, 23, 24, 25]
+
+    first = scheduler.add_request("first", max_new_tokens=1, prompt_token_ids=prompt_ids)
+    first_batch = scheduler.step()
+    first_blocks = list(first.block_table.physical_block_ids)
+    scheduler.post_step(first_batch, fake_engine.step(first_batch))
+    assert first.status == SeqStatus.FINISHED
+    assert allocator.ref_counts == {}
+    assert len(allocator.cached_free) == 3
+
+    second = scheduler.add_request("second", max_new_tokens=1, prompt_token_ids=prompt_ids)
+    second_batch = scheduler.step()
+    assert second.num_cached_tokens == 4
+    assert second.block_table.physical_block_ids[:2] == first_blocks[:2]
+    scheduler.post_step(second_batch, fake_engine.step(second_batch))
+
+    assert allocator.ref_counts == {}
+    assert allocator.num_available() == allocator.num_blocks
+    assert len(allocator.free_block_ids) + len(allocator.cached_free) == allocator.num_blocks
+
+
+def test_tiny_pool_admission_evicts_cached_prefix_blocks():
+    allocator = BlockAllocator(num_blocks=2, enable_prefix_cache=True)
+    scheduler = Scheduler(block_allocator=allocator, block_size=2, watermark_blocks=0)
+    fake_engine = FakeModelEngine()
+
+    cached_keys = []
+    for token in (30, 40):
+        seq = scheduler.add_request(
+            f"prompt-{token}",
+            max_new_tokens=1,
+            prompt_token_ids=[token, token + 1],
+        )
+        batch = scheduler.step()
+        scheduler.post_step(batch, fake_engine.step(batch))
+        cached_keys.append((None, (token, token + 1)))
+        assert cached_keys[-1] in allocator.cache
+
+    newest = scheduler.add_request("newest", max_new_tokens=1, prompt_token_ids=[50, 51])
+    batch = scheduler.step()
+    assert batch.batch_type == BatchType.PREFILL
+    assert cached_keys[0] not in allocator.cache
+    assert cached_keys[1] in allocator.cache
+    scheduler.post_step(batch, fake_engine.step(batch))
+    assert newest.status == SeqStatus.FINISHED
+    assert allocator.ref_counts == {}
+    assert allocator.num_available() == allocator.num_blocks
+
+
+def test_preempted_sequence_reuses_its_cached_prefix_on_readmission():
+    allocator = BlockAllocator(num_blocks=3, enable_prefix_cache=True)
+    scheduler = Scheduler(
+        block_allocator=allocator,
+        block_size=2,
+        watermark_blocks=0,
+        max_batch_size=2,
+        debug_invariants=True,
+    )
+    fake_engine = FakeModelEngine()
+
+    victim = scheduler.add_request("victim", max_new_tokens=3, prompt_token_ids=[1, 2, 3])
+    other = scheduler.add_request("other", max_new_tokens=3, prompt_token_ids=[8, 9])
+
+    victim_prefill = scheduler.step()
+    scheduler.post_step(victim_prefill, fake_engine.step(victim_prefill))
+    victim_prefix_ids = list(victim.block_table.physical_block_ids)
+    other_prefill = scheduler.step()
+    scheduler.post_step(other_prefill, fake_engine.step(other_prefill))
+
+    # The other sequence needs a new block first and preempts the victim.
+    preempting_batch = scheduler.step()
+    assert victim in scheduler.waiting
+    assert victim.block_table is None
+    assert preempting_batch.sequences == [other]
+    scheduler.post_step(preempting_batch, fake_engine.step(preempting_batch))
+
+    # The victim's cached hit is not counted as capacity for its remaining block;
+    # after the other sequence finishes, it can be admitted and reuse that block.
+    other_decode = scheduler.step()
+    assert other_decode.batch_type == BatchType.DECODE
+    scheduler.post_step(other_decode, fake_engine.step(other_decode))
+    readmission = scheduler.step()
+    assert readmission.batch_type == BatchType.PREFILL
+    assert readmission.sequences == [victim]
+    assert victim.num_cached_tokens == 2
+    assert victim.block_table.physical_block_ids[: victim.num_cached_tokens // 2] == (
+        victim_prefix_ids[: victim.num_cached_tokens // 2]
+    )
+    scheduler.post_step(readmission, fake_engine.step(readmission))
+
+    while scheduler.has_unfinished_requests():
+        batch = scheduler.step()
+        if batch is None:
+            continue
+        scheduler.post_step(batch, fake_engine.step(batch))
+
+    assert scheduler.preemption_count > 0
+    assert allocator.ref_counts == {}
+    assert allocator.num_available() == allocator.num_blocks
+    assert len(allocator.free_block_ids) + len(allocator.cached_free) == allocator.num_blocks

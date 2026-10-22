@@ -29,6 +29,6 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install numpy pytest pydantic fastapi "uvicorn[standard]"
 
-      - name: Run CPU Unit Tests (Allocator, Scheduler & Reference Attention)
+      - name: Run CPU Unit Tests (Allocator, Scheduler, Reference Attention & Prefix Cache)
         run: |
-          python -m pytest tests/test_block_allocator.py tests/test_scheduler_continuous_batching.py tests/test_paged_attention_reference.py -v
+          python -m pytest tests/test_block_allocator.py tests/test_scheduler_continuous_batching.py tests/test_paged_attention_reference.py tests/test_paged_attention_prefix_cache.py -v

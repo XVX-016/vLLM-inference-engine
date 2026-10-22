@@ -10,7 +10,7 @@ import argparse
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 import numpy as np
 
@@ -40,6 +40,12 @@ class TraceRequest:
     prompt_len: int
     output_len: int
     ignore_eos: bool = True
+
+
+@dataclass
+class SharedPrefixTrace:
+    requests: List[TraceRequest]
+    metadata: dict[str, Any]
 
 
 def generate_synthetic_prompt(target_token_count: int, seed: int) -> str:
@@ -109,6 +115,163 @@ def generate_workload_trace(
     return requests
 
 
+def generate_shared_prefix_trace(
+    tokenizer: Any,
+    num_requests: int = 200,
+    arrival_rate: float = 1.0,
+    prefix_count: int = 4,
+    system_prompt_tokens: int = 64,
+    seed: int = 42,
+    block_size: int = 16,
+    ignore_eos: bool = True,
+    suffix_mu: float = 3.5,
+    suffix_sigma: float = 0.5,
+    min_suffix_tokens: int = 4,
+    max_suffix_tokens: int = 512,
+    output_mu: float = 3.0,
+    output_sigma: float = 0.4,
+    min_output_tokens: int = 4,
+    max_output_tokens: int = 256,
+) -> SharedPrefixTrace:
+    """Generate tokenizer-measured requests sharing one of a pool of system prompts."""
+    if num_requests < 1 or prefix_count < 1 or system_prompt_tokens < 1:
+        raise ValueError("num_requests, prefix_count, and system_prompt_tokens must be positive.")
+    if arrival_rate <= 0 or block_size < 1:
+        raise ValueError("arrival_rate and block_size must be positive.")
+
+    rng = np.random.default_rng(seed)
+    arrivals = np.cumsum(rng.exponential(scale=1.0 / arrival_rate, size=num_requests))
+    arrivals -= arrivals[0]
+    suffix_lengths = np.clip(
+        np.round(rng.lognormal(suffix_mu, suffix_sigma, num_requests)).astype(int),
+        min_suffix_tokens,
+        max_suffix_tokens,
+    )
+    output_lengths = np.clip(
+        np.round(rng.lognormal(output_mu, output_sigma, num_requests)).astype(int),
+        min_output_tokens,
+        max_output_tokens,
+    )
+
+    def encode(text: str) -> list[int]:
+        return list(tokenizer.encode(text, add_special_tokens=True))
+
+    system_prompts: list[str] = []
+    for prefix_idx in range(prefix_count):
+        candidate = generate_synthetic_prompt(
+            target_token_count=max(system_prompt_tokens * 3, 8),
+            seed=seed * 1009 + prefix_idx,
+        )
+        candidate_ids = encode(candidate)
+        if len(candidate_ids) < system_prompt_tokens:
+            raise ValueError("Unable to generate enough system-prompt tokens.")
+        system_prompt = tokenizer.decode(
+            candidate_ids[:system_prompt_tokens],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+        system_ids = encode(system_prompt)
+        if len(system_ids) != system_prompt_tokens:
+            raise ValueError(
+                "Tokenizer does not round-trip the requested system prompt length: "
+                f"wanted {system_prompt_tokens}, got {len(system_ids)}."
+            )
+        system_prompts.append(system_prompt)
+
+    requests: list[TraceRequest] = []
+    prompt_token_ids: dict[int, list[int]] = {}
+    prefix_assignments: dict[int, int] = {}
+    for req_id in range(num_requests):
+        prefix_idx = req_id % prefix_count
+        suffix_text = generate_synthetic_prompt(
+            target_token_count=int(suffix_lengths[req_id]),
+            seed=seed * 65537 + req_id,
+        )
+        prompt_text = f"{system_prompts[prefix_idx]}\n\n{suffix_text}"
+        token_ids = encode(prompt_text)
+        share_prefix_ids = encode(f"{system_prompts[prefix_idx]}\n\n")
+        if token_ids[: len(share_prefix_ids)] != share_prefix_ids:
+            raise ValueError(
+                "Prompt tokenization changed the system-prefix token sequence at the "
+                f"boundary for request {req_id}; use a tokenizer-stable separator."
+            )
+        prompt_token_ids[req_id] = token_ids
+        prefix_assignments[req_id] = prefix_idx
+        requests.append(
+            TraceRequest(
+                request_id=req_id,
+                arrival_time_s=float(round(arrivals[req_id], 6)),
+                prompt=prompt_text,
+                prompt_len=len(token_ids),
+                output_len=int(output_lengths[req_id]),
+                ignore_eos=ignore_eos,
+            )
+        )
+
+    shareable_tokens = 0
+    for prefix_idx in range(prefix_count):
+        group_ids = [
+            prompt_token_ids[req_id]
+            for req_id, assigned_prefix in prefix_assignments.items()
+            if assigned_prefix == prefix_idx
+        ]
+        if len(group_ids) < 2:
+            continue
+        common_tokens = min(len(ids) for ids in group_ids)
+        for position in range(common_tokens):
+            token = group_ids[0][position]
+            if any(ids[position] != token for ids in group_ids[1:]):
+                common_tokens = position
+                break
+        for ids in group_ids:
+            shareable_tokens += min(
+                common_tokens,
+                max(0, ((len(ids) - 1) // block_size) * block_size),
+            )
+
+    total_prompt_tokens = sum(request.prompt_len for request in requests)
+    metadata = {
+        "seed": seed,
+        "arrival_rate_rps": arrival_rate,
+        "num_requests": num_requests,
+        "prefix_count": prefix_count,
+        "system_prompt_tokens": system_prompt_tokens,
+        "block_size": block_size,
+        "suffix_length_distribution": {
+            "name": "lognormal",
+            "mu": suffix_mu,
+            "sigma": suffix_sigma,
+            "min": min_suffix_tokens,
+            "max": max_suffix_tokens,
+        },
+        "output_length_distribution": {
+            "name": "lognormal",
+            "mu": output_mu,
+            "sigma": output_sigma,
+            "min": min_output_tokens,
+            "max": max_output_tokens,
+        },
+        "system_prompts": system_prompts,
+        "theoretical_shareable_prompt_tokens": shareable_tokens,
+        "total_prompt_tokens": total_prompt_tokens,
+        "theoretical_shareable_fraction": (
+            shareable_tokens / total_prompt_tokens if total_prompt_tokens else 0.0
+        ),
+    }
+    return SharedPrefixTrace(requests=requests, metadata=metadata)
+
+
+def save_shared_prefix_trace(trace: SharedPrefixTrace, filepath: Path | str) -> None:
+    path = Path(filepath)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "metadata": trace.metadata,
+        "requests": [asdict(request) for request in trace.requests],
+    }
+    with path.open("w", encoding="utf-8") as file:
+        json.dump(payload, file, indent=2)
+
+
 def save_trace_to_json(trace: List[TraceRequest], filepath: Path | str) -> None:
     path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -134,19 +297,43 @@ def main():
     parser.add_argument("--output-sigma", type=float, default=0.4)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output", type=str, default="benchmarks/workload_trace.json")
+    parser.add_argument("--prefix-count", type=int, default=0, help="Generate a shared-prefix trace with this pool size")
+    parser.add_argument("--system-prompt-tokens", type=int, default=64)
+    parser.add_argument("--model-name", type=str, default="Qwen/Qwen2.5-0.5B-Instruct")
     args = parser.parse_args()
 
-    trace = generate_workload_trace(
-        num_requests=args.num_requests,
-        arrival_rate=args.arrival_rate,
-        prompt_mu=args.prompt_mu,
-        prompt_sigma=args.prompt_sigma,
-        output_mu=args.output_mu,
-        output_sigma=args.output_sigma,
-        seed=args.seed,
-    )
-    save_trace_to_json(trace, args.output)
-    print(f"Generated {len(trace)} requests trace and saved to {args.output}")
+    if args.prefix_count:
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name)
+        shared_trace = generate_shared_prefix_trace(
+            tokenizer=tokenizer,
+            num_requests=args.num_requests,
+            arrival_rate=args.arrival_rate,
+            prefix_count=args.prefix_count,
+            system_prompt_tokens=args.system_prompt_tokens,
+            seed=args.seed,
+        )
+        save_shared_prefix_trace(shared_trace, args.output)
+        print(
+            f"Generated {len(shared_trace.requests)} shared-prefix requests "
+            f"(P={args.prefix_count}, S={args.system_prompt_tokens}, "
+            f"theoretical shareable fraction="
+            f"{shared_trace.metadata['theoretical_shareable_fraction']:.4f}) "
+            f"and saved to {args.output}"
+        )
+    else:
+        trace = generate_workload_trace(
+            num_requests=args.num_requests,
+            arrival_rate=args.arrival_rate,
+            prompt_mu=args.prompt_mu,
+            prompt_sigma=args.prompt_sigma,
+            output_mu=args.output_mu,
+            output_sigma=args.output_sigma,
+            seed=args.seed,
+        )
+        save_trace_to_json(trace, args.output)
+        print(f"Generated {len(trace)} requests trace and saved to {args.output}")
 
 
 if __name__ == "__main__":

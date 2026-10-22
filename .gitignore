@@ -2,9 +2,10 @@ __pycache__/
 *.pyc
 .venv/
 .pytest_cache/
-benchmarks/results/*.json
+benchmarks/results/**/*.json
 benchmarks/results/*.png
 benchmarks/results/*.log
+results/**/*.json
 benchmarks/test_trace.json
 *.log
 *trace*.json

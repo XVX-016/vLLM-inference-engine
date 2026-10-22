@@ -182,6 +182,282 @@ def test_real_gpu_four_prompts_concurrent_decode(qwen_model_and_tokenizer):
             )
 
 
+def test_real_gpu_six_prompts_prefix_cache_equivalence(qwen_model_and_tokenizer):
+    model, tokenizer, device = qwen_model_and_tokenizer
+    block_size = 16
+    num_blocks = 128
+    max_new_tokens = 8
+
+    shared_prefix_texts = (
+        "A short introduction to astronomy, the planets, stars, and galaxies in our solar system, "
+        "with an overview of the night sky.",
+        "An overview of machine learning, neural networks, training data, and how modern computers "
+        "learn useful patterns from examples.",
+    )
+    suffix_texts = (
+        "First distinct continuation.",
+        "Second distinct continuation.",
+        "Third distinct continuation.",
+    )
+    prompts: list[list[int]] = []
+    for prefix_text in shared_prefix_texts:
+        prefix_ids = tokenizer(prefix_text, return_tensors="pt").input_ids[0].tolist()
+        assert len(prefix_ids) >= block_size
+        prefix_ids = prefix_ids[:block_size]
+        for suffix_text in suffix_texts:
+            suffix_ids = tokenizer(suffix_text, add_special_tokens=False).input_ids
+            prompts.append(prefix_ids + suffix_ids)
+
+    def run_mode(prefix_mode: str):
+        allocator = BlockAllocator(
+            num_blocks=num_blocks,
+            enable_prefix_cache=prefix_mode != "off",
+        )
+        scheduler = Scheduler(
+            block_allocator=allocator,
+            block_size=block_size,
+            watermark_blocks=1,
+            max_batch_size=8,
+            debug_invariants=True,
+            prefix_mode=prefix_mode,
+        )
+        runner = KernelPagedManualDecode(
+            model=model,
+            tokenizer=tokenizer,
+            block_size=block_size,
+            num_blocks=num_blocks,
+            device=device,
+            dtype=torch.float16,
+            debug_prefix_cache=prefix_mode == "share",
+            prefix_mode=prefix_mode,
+        )
+        sequences = [
+            scheduler.add_request(
+                prompt=f"prefix-{idx}",
+                max_new_tokens=max_new_tokens,
+                prompt_token_ids=prompt_ids,
+            )
+            for idx, prompt_ids in enumerate(prompts)
+        ]
+        logits_history: dict[int, list[torch.Tensor]] = {seq.seq_id: [] for seq in sequences}
+        cached_tokens: dict[int, list[int]] = {seq.seq_id: [] for seq in sequences}
+        steps = 0
+        while scheduler.has_unfinished_requests() and steps < 500:
+            batch = scheduler.step()
+            if batch is None:
+                continue
+            for seq in batch.sequences:
+                if batch.batch_type.value == "prefill":
+                    cached_tokens[seq.seq_id].append(seq.num_cached_tokens)
+            if batch.batch_type.value == "prefill":
+                next_tokens = [runner.prefill(batch.sequences[0], allocator=allocator)]
+            else:
+                next_tokens = runner.decode_step(batch.sequences, allocator=allocator)
+            for seq in batch.sequences:
+                logits_history[seq.seq_id].append(seq.last_logits.detach().cpu())
+            scheduler.post_step(batch, next_tokens)
+            steps += 1
+
+        assert not scheduler.has_unfinished_requests(), "Scheduler did not finish within 500 steps."
+        assert allocator.ref_counts == {}
+        assert allocator.num_available() == allocator.num_blocks
+        return sequences, logits_history, cached_tokens
+
+    off_sequences, off_logits, _ = run_mode("off")
+    for prefix_mode in ("share", "full"):
+        cached_sequences, cached_logits, cached_tokens = run_mode(prefix_mode)
+        divergences = []
+        exact_matches = 0
+
+        for prompt_idx, (off_seq, cached_seq) in enumerate(zip(off_sequences, cached_sequences)):
+            if off_seq.generated_ids == cached_seq.generated_ids:
+                exact_matches += 1
+                continue
+            divergent_step = next(
+                (
+                    step
+                    for step, (off_token, cached_token) in enumerate(
+                        zip(off_seq.generated_ids, cached_seq.generated_ids)
+                    )
+                    if off_token != cached_token
+                ),
+                min(len(off_seq.generated_ids), len(cached_seq.generated_ids)),
+            )
+            logits = off_logits[off_seq.seq_id][divergent_step]
+            top2_values = torch.topk(logits, k=2).values
+            divergences.append(
+                {
+                    "prefix_mode": prefix_mode,
+                    "prompt_idx": prompt_idx,
+                    "divergent_step": divergent_step,
+                    "off_token": (
+                        off_seq.generated_ids[divergent_step]
+                        if divergent_step < len(off_seq.generated_ids)
+                        else None
+                    ),
+                    "cached_token": (
+                        cached_seq.generated_ids[divergent_step]
+                        if divergent_step < len(cached_seq.generated_ids)
+                        else None
+                    ),
+                    "top1_top2_margin": float((top2_values[0] - top2_values[1]).item()),
+                }
+            )
+
+        print(f"Prefix-cache {prefix_mode} divergences: {divergences}")
+        assert exact_matches == len(prompts), (
+            f"Prefix-cache {prefix_mode} mismatch: {len(divergences)} prompts diverged. "
+            f"First divergence and off-mode top-1/top-2 margins: {divergences}"
+        )
+        assert any(values for values in cached_tokens.values()), (
+            f"{prefix_mode} mode did not reuse any prefix-cache blocks."
+        )
+
+
+def test_real_gpu_full_prefix_prefill_logits_and_precision_yardstick(qwen_model_and_tokenizer):
+    model, tokenizer, device = qwen_model_and_tokenizer
+    block_size = 16
+    num_blocks = 128
+    prefix_texts = (
+        "A detailed overview of astronomy, including planets, stars, galaxies, telescopes, "
+        "space exploration, and the history of observing the night sky.",
+        "A practical explanation of machine learning, neural networks, data, optimization, "
+        "training, evaluation, and useful applications of modern artificial intelligence.",
+    )
+    roots = []
+    for text in prefix_texts:
+        repeated_text = " ".join([text] * 4)
+        root_ids = tokenizer(repeated_text, return_tensors="pt").input_ids[0].tolist()
+        assert len(root_ids) >= 4 * block_size
+        roots.append(root_ids[: 4 * block_size])
+
+    probe_prompts: list[list[int]] = []
+    expected_hits: list[int] = []
+    for idx in range(20):
+        hit_blocks = idx % 4 + 1
+        root = roots[idx % len(roots)]
+        suffix_text = f"Continuation number {idx} considers a different example."
+        suffix_ids = tokenizer(suffix_text, add_special_tokens=False).input_ids
+        suffix_len = idx % (block_size - 1) + 1
+        suffix_ids = (suffix_ids * ((suffix_len + len(suffix_ids) - 1) // len(suffix_ids)))[:suffix_len]
+        probe_prompts.append(root[: hit_blocks * block_size] + suffix_ids)
+        expected_hits.append(hit_blocks * block_size)
+
+    def run_prefills(prefix_mode: str):
+        allocator = BlockAllocator(
+            num_blocks=num_blocks,
+            enable_prefix_cache=prefix_mode != "off",
+        )
+        scheduler = Scheduler(
+            block_allocator=allocator,
+            block_size=block_size,
+            watermark_blocks=1,
+            max_batch_size=4,
+            debug_invariants=True,
+            prefix_mode=prefix_mode,
+        )
+        runner = KernelPagedManualDecode(
+            model=model,
+            tokenizer=tokenizer,
+            block_size=block_size,
+            num_blocks=num_blocks,
+            device=device,
+            dtype=torch.float16,
+            prefix_mode=prefix_mode,
+        )
+        [
+            scheduler.add_request(
+                prompt=f"seed-{idx}",
+                max_new_tokens=1,
+                prompt_token_ids=root,
+            )
+            for idx, root in enumerate(roots)
+        ]
+        probes = [
+            scheduler.add_request(
+                prompt=f"probe-{idx}",
+                max_new_tokens=1,
+                prompt_token_ids=prompt_ids,
+            )
+            for idx, prompt_ids in enumerate(probe_prompts)
+        ]
+        captured: dict[int, torch.Tensor] = {}
+        observed_hits: dict[int, int] = {}
+        probe_seq_ids = {seq.seq_id for seq in probes}
+
+        while scheduler.has_unfinished_requests():
+            batch = scheduler.step()
+            assert batch is not None and batch.batch_type.value == "prefill"
+            seq = batch.sequences[0]
+            if seq.seq_id in probe_seq_ids:
+                observed_hits[seq.seq_id] = seq.num_cached_tokens
+            token = runner.prefill(seq, allocator=allocator)
+            captured[seq.seq_id] = seq.last_logits.detach().cpu()
+            scheduler.post_step(batch, [token])
+
+        assert allocator.ref_counts == {}
+        assert allocator.num_available() == num_blocks
+        return probes, captured, observed_hits
+
+    off_probes, off_logits, _ = run_prefills("off")
+    full_probes, full_logits, full_hits = run_prefills("full")
+    cache_differences = []
+    for idx, (off_seq, full_seq) in enumerate(zip(off_probes, full_probes)):
+        assert full_hits[full_seq.seq_id] == expected_hits[idx]
+        cache_differences.append(
+            (off_logits[off_seq.seq_id].float() - full_logits[full_seq.seq_id].float())
+            .abs()
+            .max()
+            .item()
+        )
+
+    model_dtype = next(model.parameters()).dtype
+    fp32_differences = []
+    try:
+        model.to(dtype=torch.float32)
+        with torch.inference_mode():
+            for prompt_ids, off_seq in zip(probe_prompts, off_probes):
+                input_ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+                fp32_logits = model(
+                    input_ids=input_ids,
+                    use_cache=False,
+                    logits_to_keep=1,
+                ).logits[0, -1].float().cpu()
+                fp16_logits = off_logits[off_seq.seq_id].float()
+                fp32_differences.append((fp16_logits - fp32_logits).abs().max().item())
+    finally:
+        model.to(dtype=model_dtype)
+
+    cache_max_diff = max(cache_differences)
+    precision_max_diff = max(fp32_differences)
+    per_probe_differences = [
+        {
+            "probe_idx": idx,
+            "cached_tokens": expected_hits[idx],
+            "max_abs_diff": cache_differences[idx],
+            "fp16_vs_fp32_max_abs_diff": fp32_differences[idx],
+        }
+        for idx in range(len(probe_prompts))
+    ]
+    by_hit_depth = {
+        hit_tokens: max(
+            difference
+            for difference, observed_hit in zip(cache_differences, expected_hits)
+            if observed_hit == hit_tokens
+        )
+        for hit_tokens in set(expected_hits)
+    }
+    print(
+        "Full-prefix prefill max abs logit difference: "
+        f"full-vs-off={cache_max_diff:.8g}, fp16-vs-fp32={precision_max_diff:.8g}, "
+        f"by_cached_tokens={by_hit_depth}, probes={per_probe_differences}"
+    )
+    assert cache_max_diff <= max(2 * precision_max_diff, 1e-5), (
+        f"Cached-prefix logit difference {cache_max_diff} exceeded twice the fp16-vs-fp32 "
+        f"yardstick {precision_max_diff}. Probe details: {per_probe_differences}"
+    )
+
+
 def test_real_gpu_preemption_stress_tiny_pool(qwen_model_and_tokenizer):
     """
     (2) A deliberately small pool (e.g. 80 blocks) with 10 concurrent requests

@@ -7,12 +7,14 @@ into Hugging Face decoder layers for decode steps.
 from __future__ import annotations
 
 import math
+import logging
 from contextlib import contextmanager
-from typing import Any, Callable, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
 from transformers.models.qwen2.modeling_qwen2 import apply_rotary_pos_emb
+from transformers.cache_utils import DynamicCache, DynamicLayer
 
 from engine.kernels.paged_attention import (
     pad_block_tables,
@@ -20,6 +22,8 @@ from engine.kernels.paged_attention import (
     paged_attention_decode_v2,
 )
 from engine.memory.block_allocator import BlockAllocator, BlockTable, PhysicalBlockPool
+
+logger = logging.getLogger(__name__)
 
 
 class PagedAttentionContext:
@@ -209,7 +213,8 @@ class KernelPagedManualDecode:
     Paged manual decode engine with Triton paged attention kernel integration.
     
     Prefill: runs model forward to compute prompt representations and K/V,
-    then copies prefill K/V into PhysicalBlockPool.
+    then copies owned K/V into PhysicalBlockPool. Prefix mode "full" seeds HF
+    prefill with the cached prefix through a DynamicCache.
     
     Decode: runs decoder forward with custom paged attention kernel patched into
     each layer's self_attn, directly writing new K/V and computing paged attention.
@@ -224,12 +229,20 @@ class KernelPagedManualDecode:
         gpu_memory_utilization: float = 0.65,
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
+        debug_prefix_cache: bool = False,
+        prefix_mode: Literal["off", "share", "full"] = "off",
     ):
+        if prefix_mode not in ("off", "share", "full"):
+            raise ValueError(
+                f"Unsupported prefix_mode {prefix_mode!r}; expected 'off', 'share', or 'full'."
+            )
         self.model = model
         self.tokenizer = tokenizer
         self.block_size = block_size
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
         self.dtype = dtype
+        self.debug_prefix_cache = debug_prefix_cache
+        self.prefix_mode = prefix_mode
 
         config = model.config
         self.num_layers = getattr(config, "num_hidden_layers", 24)
@@ -267,6 +280,7 @@ class KernelPagedManualDecode:
         pkv: Any,
         block_table: BlockTable,
         prompt_len: int,
+        skip_blocks: int = 0,
     ) -> None:
         """
         Copies prefill K/V tensors into the PhysicalBlockPool.
@@ -275,7 +289,7 @@ class KernelPagedManualDecode:
         block_table.num_tokens = prompt_len before calling prefill().
         This method ONLY writes tensor data — it never calls allocate().
         """
-        for t in range(prompt_len):
+        for t in range(skip_blocks * self.block_size, prompt_len):
             logical_block_idx = t // self.block_size
             physical_block_id = block_table.physical_block_ids[logical_block_idx]
             offset = t % self.block_size
@@ -291,6 +305,72 @@ class KernelPagedManualDecode:
                 self.pool.k_cache[layer_idx][physical_block_id, offset] = k_tok.squeeze(0).to(self.dtype)
                 self.pool.v_cache[layer_idx][physical_block_id, offset] = v_tok.squeeze(0).to(self.dtype)
 
+    def _compare_cached_prefill_kv(
+        self,
+        pkv: Any,
+        block_table: BlockTable,
+        cached_tokens: int,
+    ) -> None:
+        for layer_idx in range(self.num_layers):
+            max_difference = 0.0
+            for token_idx in range(cached_tokens):
+                block_id = block_table.physical_block_ids[token_idx // self.block_size]
+                offset = token_idx % self.block_size
+                if hasattr(pkv, "layers"):
+                    fresh_key = pkv.layers[layer_idx].keys[:, :, token_idx, :]
+                    fresh_value = pkv.layers[layer_idx].values[:, :, token_idx, :]
+                else:
+                    fresh_key = pkv[layer_idx][0][:, :, token_idx, :]
+                    fresh_value = pkv[layer_idx][1][:, :, token_idx, :]
+
+                stored_key = self.pool.k_cache[layer_idx][block_id, offset].unsqueeze(0)
+                stored_value = self.pool.v_cache[layer_idx][block_id, offset].unsqueeze(0)
+                key_difference = (
+                    fresh_key.squeeze(0).to(self.dtype).float() - stored_key.float()
+                ).abs().max().item()
+                value_difference = (
+                    fresh_value.squeeze(0).to(self.dtype).float() - stored_value.float()
+                ).abs().max().item()
+                max_difference = max(max_difference, key_difference, value_difference)
+
+            logger.info(
+                "Prefix-cache KV comparison layer=%d max_abs_difference=%g "
+                "(cached_tokens=%d)",
+                layer_idx,
+                max_difference,
+                cached_tokens,
+            )
+
+    def _build_cached_prefix(self, block_table: BlockTable, cached_tokens: int) -> DynamicCache:
+        cache = DynamicCache()
+        num_blocks = cached_tokens // self.block_size
+        for layer_idx in range(self.num_layers):
+            key_blocks = []
+            value_blocks = []
+            for block_idx in range(num_blocks):
+                block_id = block_table.physical_block_ids[block_idx]
+                key_blocks.append(self.pool.k_cache[layer_idx][block_id])
+                value_blocks.append(self.pool.v_cache[layer_idx][block_id])
+
+            key = (
+                torch.cat(key_blocks, dim=0)
+                .permute(1, 0, 2)
+                .unsqueeze(0)
+                .contiguous()
+            )
+            value = (
+                torch.cat(value_blocks, dim=0)
+                .permute(1, 0, 2)
+                .unsqueeze(0)
+                .contiguous()
+            )
+            layer = DynamicLayer()
+            layer.keys = key
+            layer.values = value
+            layer.is_initialized = True
+            cache.layers.append(layer)
+        return cache
+
     @torch.inference_mode()
     def prefill(
         self,
@@ -298,9 +378,10 @@ class KernelPagedManualDecode:
         allocator: Optional[BlockAllocator] = None,
     ) -> int:
         """
-        Single-sequence prefill step via standard HuggingFace forward.
-        Copies the full K/V into the physical blocks that the Scheduler
-        already allocated and stored in seq.block_table.
+        Single-sequence Hugging Face prefill. In "full" mode, cached K/V blocks
+        seed a DynamicCache and only the uncached prompt suffix is forwarded.
+        Other modes forward the full prompt and copy only blocks owned by this
+        sequence.
 
         CONTRACT: The scheduler has already allocated seq.block_table.physical_block_ids
         and set seq.block_table.num_tokens = prompt_len before calling this.
@@ -342,12 +423,58 @@ class KernelPagedManualDecode:
                 "The scheduler must call step() before prefill()."
             )
 
-        # 3. HF prefill forward pass
-        prefill_out = self.model(input_ids=input_ids, use_cache=True)
-        pkv = prefill_out.past_key_values
+        cached_tokens = (
+            getattr(seq, "num_cached_tokens", 0)
+            if not isinstance(seq, dict)
+            else seq.get("num_cached_tokens", 0)
+        )
+        if cached_tokens < 0 or cached_tokens > prompt_len or cached_tokens % self.block_size:
+            raise ValueError(
+                f"num_cached_tokens={cached_tokens} must be a full-block prefix within "
+                f"prompt_len={prompt_len} (block_size={self.block_size})."
+            )
+        if cached_tokens // self.block_size > len(block_table.physical_block_ids):
+            raise ValueError("num_cached_tokens exceeds the number of blocks in the sequence table.")
 
-        # Write K/V data into already-allocated blocks (no allocation here).
-        self._copy_prefill_kv(pkv, block_table, prompt_len)
+        if self.prefix_mode == "full" and cached_tokens:
+            cached_prefix = self._build_cached_prefix(block_table, cached_tokens)
+            suffix_ids = input_ids[:, cached_tokens:]
+            position_ids = torch.arange(
+                cached_tokens,
+                prompt_len,
+                dtype=torch.long,
+                device=self.device,
+            ).unsqueeze(0)
+            attention_mask = torch.ones(
+                (input_ids.shape[0], prompt_len),
+                dtype=torch.long,
+                device=self.device,
+            )
+            prefill_out = self.model(
+                input_ids=suffix_ids,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
+                past_key_values=cached_prefix,
+                use_cache=True,
+                logits_to_keep=1,
+            )
+            pkv = prefill_out.past_key_values
+            self._copy_prefill_kv(pkv, block_table, prompt_len, skip_blocks=cached_tokens // self.block_size)
+        else:
+            # 3. HF prefill forward pass; "share" mode recomputes the prompt and
+            # avoids overwriting cache-hit blocks in the physical pool.
+            prefill_out = self.model(input_ids=input_ids, use_cache=True, logits_to_keep=1)
+            pkv = prefill_out.past_key_values
+
+            # Write K/V data into the blocks owned exclusively by this sequence.
+            if self.debug_prefix_cache and cached_tokens:
+                self._compare_cached_prefill_kv(pkv, block_table, cached_tokens)
+            self._copy_prefill_kv(
+                pkv,
+                block_table,
+                prompt_len,
+                skip_blocks=cached_tokens // self.block_size,
+            )
 
         logits = prefill_out.logits[:, -1, :]
         next_token_id = int(torch.argmax(logits, dim=-1).item())
@@ -355,8 +482,12 @@ class KernelPagedManualDecode:
         # Store logits for diagnostics.
         if hasattr(seq, "last_logits"):
             seq.last_logits = logits[0].detach().cpu()
+            top2 = torch.topk(logits[0], k=2).values
+            seq.last_logit_margin = float((top2[0] - top2[1]).item())
         elif isinstance(seq, dict):
             seq["last_logits"] = logits[0].detach().cpu()
+            top2 = torch.topk(logits[0], k=2).values
+            seq["last_logit_margin"] = float((top2[0] - top2[1]).item())
 
         # Do NOT set last_token_id or append to generated_ids here.
         # Those are the exclusive responsibility of Scheduler.post_step().
@@ -386,6 +517,7 @@ class KernelPagedManualDecode:
         N = len(seqs)
         if N == 0:
             return []
+        allocator = allocator or self.allocator
 
         # ── runtime grad probe (printed once per process) ────────────────────
         if not getattr(self, "_grad_probed", False):
@@ -425,6 +557,19 @@ class KernelPagedManualDecode:
             # Bump it by 1 so the kernel writes at the next available slot.
             # IMPORTANT: this is the only place num_tokens is incremented for decode;
             # post_step() mirrors cur_len from it but must NOT increment again.
+            write_block_idx = bt.num_tokens // self.block_size
+            if write_block_idx >= len(bt.physical_block_ids):
+                raise AssertionError(
+                    f"Decode write for seq {getattr(seq, 'seq_id', '?')} has no allocated block "
+                    f"at logical index {write_block_idx}."
+                )
+            write_block_id = bt.physical_block_ids[write_block_idx]
+            if allocator.ref_counts.get(write_block_id, 0) > 1:
+                raise AssertionError(
+                    f"Decode write for seq {getattr(seq, 'seq_id', '?')} would modify shared "
+                    f"block {write_block_id} with ref_count "
+                    f"{allocator.ref_counts[write_block_id]}."
+                )
             bt.num_tokens += 1
             new_len = bt.num_tokens  # = old_kv_len + 1
 
@@ -478,8 +623,12 @@ class KernelPagedManualDecode:
         for i, seq in enumerate(seqs):
             if hasattr(seq, "last_logits"):
                 seq.last_logits = step_logits[i].detach().cpu()
+                top2 = torch.topk(step_logits[i], k=2).values
+                seq.last_logit_margin = float((top2[0] - top2[1]).item())
             elif isinstance(seq, dict):
                 seq["last_logits"] = step_logits[i].detach().cpu()
+                top2 = torch.topk(step_logits[i], k=2).values
+                seq["last_logit_margin"] = float((top2[0] - top2[1]).item())
 
         return next_tokens
 

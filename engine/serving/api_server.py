@@ -97,6 +97,8 @@ def build_default_engine(
 
     block_size = int(os.environ.get("VLLM_BLOCK_SIZE", str(block_size)))
     watermark_blocks = int(os.environ.get("VLLM_WATERMARK_BLOCKS", str(watermark_blocks)))
+    prefix_mode = os.environ.get("VLLM_PREFIX_MODE", "off")
+    enable_prefix_cache = prefix_mode in ("share", "full")
     max_batch_size_env = os.environ.get("VLLM_MAX_BATCH_SIZE")
     max_batch_size = int(max_batch_size_env) if max_batch_size_env is not None else 32
 
@@ -107,12 +109,13 @@ def build_default_engine(
     else:
         total_blocks = int(os.environ.get("VLLM_TOTAL_BLOCKS", "64"))
 
-    allocator = BlockAllocator(num_blocks=total_blocks)
+    allocator = BlockAllocator(num_blocks=total_blocks, enable_prefix_cache=enable_prefix_cache)
     scheduler = Scheduler(
         block_allocator=allocator,
         block_size=block_size,
         watermark_blocks=watermark_blocks,
         max_batch_size=max_batch_size,
+        prefix_mode=prefix_mode,
     )
     if runner is None:
         logger.info(f"Loading KernelPagedManualDecode on GPU with {total_blocks} blocks...")
@@ -135,6 +138,7 @@ def build_default_engine(
             num_blocks=total_blocks,
             device="cuda" if torch.cuda.is_available() else "cpu",
             dtype=torch.float16,
+            prefix_mode=prefix_mode,
         )
         if tokenizer is None:
             tokenizer = hf_tok
@@ -172,6 +176,7 @@ class CompletionRequest(BaseModel):
     stream: Optional[bool] = False
     stop: Optional[Union[str, List[str]]] = None
     ignore_eos: Optional[bool] = False
+    include_token_ids: Optional[bool] = False
 
 
 def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
@@ -202,7 +207,7 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
         bytes_per_token = 2 * num_layers * num_kv_heads * head_dim * dtype_bytes
         bytes_per_block = bytes_per_token * block_size
 
-        allocated_blocks = allocator.num_blocks - len(allocator.free_block_ids)
+        allocated_blocks = allocator.num_blocks - allocator.num_available()
         tokens_stored = sum(seq.kv_len for seq in eng.scheduler.running)
 
         allocated_kv_bytes = allocated_blocks * bytes_per_block
@@ -222,7 +227,17 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
         return {
             "running": len(eng.scheduler.running),
             "waiting": len(eng.scheduler.waiting),
-            "free_blocks": len(allocator.free_block_ids),
+            "free_blocks": allocator.num_available(),
+            "cached_free_blocks": len(allocator.cached_free),
+            "prefix_hit_rate": (
+                eng.scheduler.prefix_cached_tokens / eng.scheduler.prefix_prompt_tokens
+                if eng.scheduler.prefix_prompt_tokens
+                else 0.0
+            ),
+            "prefix_cached_tokens": eng.scheduler.prefix_cached_tokens,
+            "prefix_prompt_tokens": eng.scheduler.prefix_prompt_tokens,
+            "blocks_saved": eng.scheduler.prefix_blocks_saved,
+            "cache_evictions": allocator.eviction_count,
             "total_blocks": allocator.num_blocks,
             "allocated_blocks": allocated_blocks,
             "block_size": block_size,
@@ -325,6 +340,7 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
             max_tokens=max_tokens,
             prompt_token_ids=prompt_token_ids,
             ignore_eos=bool(req.ignore_eos),
+            include_token_metadata=bool(req.include_token_ids),
         )
 
         def decode_token(tok_id: int) -> str:
@@ -338,9 +354,16 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
                 accumulated_text = ""
                 finish_reason: Optional[str] = None
                 output_tokens = 0
+                generated_token_margins: List[Optional[float]] = []
 
                 try:
-                    async for tok in token_gen:
+                    async for output in token_gen:
+                        if req.include_token_ids:
+                            tok, logit_margin = output
+                            generated_token_margins.append(logit_margin)
+                        else:
+                            tok = output
+                            logit_margin = None
                         # Non-blocking check for client disconnect
                         try:
                             if await asyncio.wait_for(raw_request.is_disconnected(), timeout=0.0001):
@@ -375,6 +398,9 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
                                 }
                             ],
                         }
+                        if req.include_token_ids:
+                            chunk_data["token_id"] = tok
+                            chunk_data["top1_top2_margin"] = logit_margin
                         yield f"data: {json.dumps(chunk_data)}\n\n"
 
                         if hit_stop:
@@ -443,10 +469,17 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
         # Non-streaming response
         accumulated_text = ""
         output_tokens = 0
+        generated_token_ids: List[int] = []
+        generated_token_margins: List[Optional[float]] = []
         finish_reason = "length"
 
         try:
-            async for tok in token_gen:
+            async for output in token_gen:
+                if req.include_token_ids:
+                    tok, logit_margin = output
+                    generated_token_margins.append(logit_margin)
+                else:
+                    tok = output
                 try:
                     if await asyncio.wait_for(raw_request.is_disconnected(), timeout=0.0001):
                         logger.info(f"Client disconnected for request {req_id}; aborting.")
@@ -455,6 +488,7 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
                     pass
 
                 output_tokens += 1
+                generated_token_ids.append(tok)
                 tok_str = decode_token(tok)
                 accumulated_text += tok_str
 
@@ -472,7 +506,7 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
         finally:
             await token_gen.aclose()
 
-        return {
+        response = {
             "id": req_id,
             "object": "text_completion",
             "created": created_ts,
@@ -491,6 +525,10 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
                 "total_tokens": prompt_len + output_tokens,
             },
         }
+        if req.include_token_ids:
+            response["token_ids"] = generated_token_ids
+            response["top1_top2_margins"] = generated_token_margins
+        return response
 
     return app
 

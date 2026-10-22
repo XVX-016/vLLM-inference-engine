@@ -28,7 +28,7 @@ import itertools
 import logging
 import math
 from dataclasses import dataclass, field
-from typing import Any, List, Optional, Set
+from typing import Any, List, Literal, Optional
 
 from engine.memory.block_allocator import BlockAllocator, BlockTable
 
@@ -52,11 +52,14 @@ class Sequence:
     prompt_token_ids: list[int] = field(default_factory=list)
     block_table: Optional[BlockTable] = None
     cur_len: int = 0
+    num_cached_tokens: int = 0
+    prefix_stats_recorded: bool = False
     last_token_id: Optional[int] = None
     num_preemptions: int = 0
     total_generated_tokens: int = 0
     all_generated_ids: list[int] = field(default_factory=list)
     last_logits: Optional[Any] = None
+    last_logit_margin: Optional[float] = None
     ignore_eos: bool = False
 
     @property
@@ -132,13 +135,23 @@ class Scheduler:
         max_batch_size: int = 32,
         eos_token_id: Optional[int] = None,
         debug_invariants: bool = False,
+        prefix_mode: Optional[Literal["off", "share", "full"]] = None,
     ):
+        if prefix_mode not in (None, "off", "share", "full"):
+            raise ValueError(
+                f"Unsupported prefix_mode {prefix_mode!r}; expected 'off', 'share', or 'full'."
+            )
+        if prefix_mode in ("share", "full") and not block_allocator.enable_prefix_cache:
+            raise ValueError(
+                f"prefix_mode={prefix_mode!r} requires an allocator with prefix caching enabled."
+            )
         self.block_allocator = block_allocator
         self.block_size = block_size
         self.watermark_blocks = watermark_blocks
         self.max_batch_size = max_batch_size
         self.eos_token_id = eos_token_id
         self.debug_invariants = debug_invariants
+        self.prefix_mode = prefix_mode
 
         self.waiting: list[Sequence] = []
         self.running: list[Sequence] = []
@@ -146,6 +159,13 @@ class Scheduler:
         self._id_counter = itertools.count()
         self.preemption_count: int = 0
         self.admission_blocked_count: int = 0
+        self.prefix_prompt_tokens: int = 0
+        self.prefix_cached_tokens: int = 0
+        self.prefix_blocks_saved: int = 0
+
+    @property
+    def _prefix_cache_enabled(self) -> bool:
+        return self.block_allocator.enable_prefix_cache and self.prefix_mode != "off"
 
     def add_request(
         self,
@@ -174,11 +194,33 @@ class Scheduler:
             return 1
         return (num_tokens + self.block_size - 1) // self.block_size
 
+    def _register_completed_blocks(self, seq: Sequence, token_ids: list[int]) -> None:
+        if not self._prefix_cache_enabled or seq.block_table is None:
+            return
+
+        full_blocks = min(
+            seq.block_table.num_tokens // self.block_size,
+            len(token_ids) // self.block_size,
+        )
+        parent_key = None
+        for block_idx in range(full_blocks):
+            token_start = block_idx * self.block_size
+            block_tokens = tuple(token_ids[token_start : token_start + self.block_size])
+            key = (parent_key, block_tokens)
+            block_id = seq.block_table.physical_block_ids[block_idx]
+            existing_block = self.block_allocator.cache.get(key)
+            if existing_block is None:
+                self.block_allocator.register(block_id, key)
+            elif existing_block == block_id:
+                self.block_allocator.register(block_id, key)
+            parent_key = key
+
     def free_sequence(self, seq: Sequence) -> None:
         """Frees all physical blocks held by sequence and updates its status."""
         if seq.block_table is not None:
             seq.block_table.free(self.block_allocator)
             seq.block_table = None
+        seq.num_cached_tokens = 0
         seq.status = SeqStatus.FINISHED
 
     def abort_sequence(self, seq_id: int) -> bool:
@@ -212,7 +254,7 @@ class Scheduler:
         self.preemption_count += 1
         victim.num_preemptions += 1
         pool_size = self.block_allocator.num_blocks
-        allocated_blocks = pool_size - len(self.block_allocator.free_block_ids)
+        allocated_blocks = pool_size - self.block_allocator.num_available()
         logger.info(
             f"Preempting sequence {victim.seq_id} (preemption #{self.preemption_count}). "
             f"Peak allocated blocks: {allocated_blocks}/{pool_size} (pool size: {pool_size}). "
@@ -223,6 +265,7 @@ class Scheduler:
         if victim.block_table is not None:
             victim.block_table.free(self.block_allocator)
             victim.block_table = None
+        victim.num_cached_tokens = 0
 
         # Fold generated tokens into prompt_token_ids for re-prefill
         if victim.generated_ids:
@@ -256,6 +299,13 @@ class Scheduler:
             return
 
         for seq, tok in zip(batch.sequences, next_tokens):
+            if seq.block_table is not None:
+                if batch.batch_type == BatchType.PREFILL:
+                    kv_token_ids = seq.prompt_token_ids
+                else:
+                    kv_token_ids = seq.prompt_token_ids + seq.generated_ids
+                self._register_completed_blocks(seq, kv_token_ids)
+
             seq.last_token_id = tok
             seq.generated_ids.append(tok)
             seq.all_generated_ids.append(tok)
@@ -318,26 +368,45 @@ class Scheduler:
             candidate = self.waiting[0]
             prompt_len = candidate.cur_len or len(candidate.prompt_token_ids)
             blocks_for_prompt = self._calc_blocks_needed(prompt_len)
+            cached_block_ids: list[int] = []
+            if self._prefix_cache_enabled:
+                cached_block_ids = self.block_allocator.lookup_prefix(candidate.prompt_token_ids)
+                max_cached_blocks = max(0, (prompt_len - 1) // self.block_size)
+                cached_block_ids = cached_block_ids[:max_cached_blocks]
+            blocks_to_allocate = blocks_for_prompt - len(cached_block_ids)
+            cached_free_hits = sum(
+                block_id in self.block_allocator.cached_free for block_id in cached_block_ids
+            )
+            available_after_hits = self.block_allocator.num_available() - cached_free_hits
 
             # Check if candidate can never fit in pool
-            if blocks_for_prompt > self.block_allocator.num_blocks:
+            if blocks_to_allocate > self.block_allocator.num_blocks:
                 self.waiting.pop(0)
                 candidate.status = SeqStatus.FINISHED
                 raise MemoryError(
-                    f"Sequence {candidate.seq_id} requires {blocks_for_prompt} blocks for prompt, "
+                    f"Sequence {candidate.seq_id} requires {blocks_to_allocate} blocks for prompt, "
                     f"exceeding total pool capacity of {self.block_allocator.num_blocks} blocks."
                 )
 
-            if self.block_allocator.can_allocate(blocks_for_prompt + self.watermark_blocks):
+            if available_after_hits >= blocks_to_allocate + self.watermark_blocks:
                 admitted = self.waiting.pop(0)
 
                 if admitted.block_table is None:
                     admitted.block_table = BlockTable(seq_id=admitted.seq_id, block_size=self.block_size)
 
-                # Allocate physical blocks for the full prompt now, so the free-list
-                # correctly reflects consumed capacity before the model forward pass.
+                admitted.num_cached_tokens = len(cached_block_ids) * self.block_size
+                if not admitted.prefix_stats_recorded:
+                    self.prefix_prompt_tokens += prompt_len
+                    self.prefix_cached_tokens += admitted.num_cached_tokens
+                    self.prefix_blocks_saved += len(cached_block_ids)
+                    admitted.prefix_stats_recorded = True
+                for blk in cached_block_ids:
+                    self.block_allocator.acquire(blk)
+                    admitted.block_table.physical_block_ids.append(blk)
+
+                # Allocate only the uncached prompt blocks before model execution.
                 # This ensures watermark checks and preemption triggers work properly.
-                for _ in range(blocks_for_prompt):
+                for _ in range(blocks_to_allocate):
                     blk = self.block_allocator.allocate()
                     admitted.block_table.physical_block_ids.append(blk)
                 admitted.block_table.num_tokens = prompt_len
@@ -412,13 +481,13 @@ class Scheduler:
 
         Invariant 1 — Block coverage:
             ceil(bt.num_tokens / block_size) == len(bt.physical_block_ids)
-        Invariant 2 — No aliasing:
-            no physical block id appears in more than one sequence's table.
+        Invariant 2 — Shared references:
+            allocator.ref_counts[block_id] equals the number of running block
+            tables containing that physical block.
         Invariant 3 — Conservation:
-            sum(blocks in running tables) + free_blocks == total_blocks
+            referenced + plain free + cached-free == total blocks
         """
-        seen_blocks: Set[int] = set()
-        used_blocks = 0
+        table_ref_counts: dict[int, int] = {}
 
         for seq in self.running:
             bt = seq.block_table
@@ -434,19 +503,21 @@ class Scheduler:
                 )
 
             for blk_id in bt.physical_block_ids:
-                if blk_id in seen_blocks:
-                    raise AssertionError(
-                        f"[Invariant 2] Physical block {blk_id} appears in multiple block "
-                        f"tables (second occurrence in seq {seq.seq_id})."
-                    )
-                seen_blocks.add(blk_id)
-                used_blocks += 1
+                table_ref_counts[blk_id] = table_ref_counts.get(blk_id, 0) + 1
 
-        free_blocks = len(self.block_allocator.free_block_ids)
-        total = self.block_allocator.num_blocks
-        if used_blocks + free_blocks != total:
+        if table_ref_counts != self.block_allocator.ref_counts:
             raise AssertionError(
-                f"[Invariant 3] Block conservation: running tables hold {used_blocks}, "
-                f"free={free_blocks}, total={total}. "
-                f"Delta={used_blocks + free_blocks - total} (positive = leaked)."
+                f"[Invariant 2] Block table references {table_ref_counts} do not match "
+                f"allocator references {self.block_allocator.ref_counts}."
+            )
+
+        referenced_blocks = len(self.block_allocator.ref_counts)
+        plain_free_blocks = len(self.block_allocator.free_block_ids)
+        cached_free_blocks = len(self.block_allocator.cached_free)
+        total = self.block_allocator.num_blocks
+        if referenced_blocks + plain_free_blocks + cached_free_blocks != total:
+            raise AssertionError(
+                f"[Invariant 3] Block conservation: referenced={referenced_blocks}, "
+                f"plain_free={plain_free_blocks}, cached_free={cached_free_blocks}, "
+                f"total={total}."
             )

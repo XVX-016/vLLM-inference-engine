@@ -50,6 +50,8 @@ class RequestBenchmarkResult:
     first_token_time: Optional[float] = None
     finish_time: Optional[float] = None
     token_timestamps: List[float] = field(default_factory=list)
+    token_ids: List[int] = field(default_factory=list)
+    token_margins: List[Optional[float]] = field(default_factory=list)
     success: bool = False
     error: Optional[str] = None
     is_warmup: bool = False
@@ -98,6 +100,12 @@ class MetricSample:
     active_token_kv_bytes: int = 0
     total_kv_bytes: int = 0
     admission_blocked: int = 0
+    cached_free_blocks: int = 0
+    prefix_hit_rate: float = 0.0
+    prefix_cached_tokens: int = 0
+    prefix_prompt_tokens: int = 0
+    blocks_saved: int = 0
+    cache_evictions: int = 0
 
     @property
     def blocks_in_use(self) -> int:
@@ -173,6 +181,12 @@ async def poll_metrics_loop(
                             active_token_kv_bytes=int(data.get("active_token_kv_bytes", 0)),
                             total_kv_bytes=int(data.get("total_kv_bytes", data.get("total_reserved_kv_bytes", 0))),
                             admission_blocked=int(data.get("admission_blocked", 0)),
+                            cached_free_blocks=int(data.get("cached_free_blocks", 0)),
+                            prefix_hit_rate=float(data.get("prefix_hit_rate", 0.0)),
+                            prefix_cached_tokens=int(data.get("prefix_cached_tokens", 0)),
+                            prefix_prompt_tokens=int(data.get("prefix_prompt_tokens", 0)),
+                            blocks_saved=int(data.get("blocks_saved", 0)),
+                            cache_evictions=int(data.get("cache_evictions", 0)),
                         )
                     )
         except Exception:
@@ -190,6 +204,7 @@ async def send_single_request(
     req: TraceRequest,
     is_warmup: bool,
     stream: bool = True,
+    include_token_ids: bool = False,
 ) -> RequestBenchmarkResult:
     """Dispatches a single completion request (streaming SSE or non-streaming) and instruments timings."""
     url = f"{base_url.rstrip('/')}/v1/completions"
@@ -200,6 +215,7 @@ async def send_single_request(
         "temperature": 0.0,
         "stream": stream,
         "ignore_eos": req.ignore_eos,
+        "include_token_ids": include_token_ids,
     }
 
     result = RequestBenchmarkResult(
@@ -235,9 +251,15 @@ async def send_single_request(
                     try:
                         chunk = json.loads(data_str)
                         choices = chunk.get("choices", [])
-                        if choices and choices[0].get("text"):
+                        if choices and (choices[0].get("text") or "token_id" in chunk):
                             result.actual_output_len += 1
                             result.token_timestamps.append(now)
+                            if "token_id" in chunk:
+                                result.token_ids.append(int(chunk["token_id"]))
+                                margin = chunk.get("top1_top2_margin")
+                                result.token_margins.append(
+                                    float(margin) if margin is not None else None
+                                )
                     except json.JSONDecodeError:
                         pass
         else:
@@ -253,6 +275,8 @@ async def send_single_request(
                 usage = data.get("usage", {})
                 result.actual_output_len = usage.get("completion_tokens", req.output_len)
                 result.token_timestamps.append(now)
+                if include_token_ids:
+                    result.token_ids = [int(token) for token in data.get("token_ids", [])]
 
         result.finish_time = time.perf_counter()
         result.success = True
@@ -366,6 +390,7 @@ async def run_trace_replay(
     max_duration_s: Optional[float] = None,
     stream: bool = True,
     slo_threshold_s: float = 2.0,
+    include_token_ids: bool = False,
 ) -> Tuple[RunSummary, List[RequestBenchmarkResult], List[MetricSample]]:
     """Replays a trace at the specified offered rate, polling metrics concurrently."""
     metric_samples: List[MetricSample] = []
@@ -397,6 +422,7 @@ async def run_trace_replay(
                     req=trace[i],
                     is_warmup=True,
                     stream=stream,
+                    include_token_ids=include_token_ids,
                 )
                 results.append(warm_res)
 
@@ -425,6 +451,7 @@ async def run_trace_replay(
                     req=req,
                     is_warmup=False,
                     stream=stream,
+                    include_token_ids=include_token_ids,
                 )
             )
             active_tasks.append(task)

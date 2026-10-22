@@ -83,6 +83,9 @@ async def test_lifespan_health_and_metrics():
             assert metrics["total_blocks"] == total_blocks
             assert metrics["preemptions"] == 0
             assert metrics["tokens_generated"] == 0
+            assert metrics["cached_free_blocks"] == 0
+            assert metrics["prefix_hit_rate"] == 0.0
+            assert metrics["cache_evictions"] == 0
 
 
 @pytest.mark.anyio
@@ -158,6 +161,7 @@ async def test_completions_streaming_sse():
                 "max_tokens": 4,
                 "temperature": 0.0,
                 "stream": True,
+                "include_token_ids": True,
             }
             async with client.stream("POST", "/v1/completions", json=req_payload) as response:
                 assert response.status_code == 200
@@ -178,6 +182,8 @@ async def test_completions_streaming_sse():
                 first_chunk = json.loads(data_lines[0][6:])
                 assert first_chunk["object"] == "text_completion"
                 assert "text" in first_chunk["choices"][0]
+                assert isinstance(first_chunk["token_id"], int)
+                assert first_chunk["top1_top2_margin"] is None
 
             # Ensure all blocks freed
             allocator = engine.scheduler.block_allocator

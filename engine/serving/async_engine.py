@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, AsyncGenerator, Dict, List, Optional, Set, Union
 
@@ -70,10 +71,11 @@ class AsyncEngine:
         self.prefill_iterations: int = 0
         self.total_tokens_generated: int = 0
         self.aborted_requests_count: int = 0
-        self.start_time: float = asyncio.get_event_loop().time() if asyncio.get_event_loop().is_running() else time.time()
+        self.start_time: float = time.time()
 
         # Per-request queues mapping seq_id -> asyncio.Queue[Union[int, _StopTokenSentinel]]
         self._output_queues: Dict[int, asyncio.Queue] = {}
+        self._include_token_metadata: Set[int] = set()
         # Set of sequence IDs aborted by client disconnect / cancellation
         self._aborted_seq_ids: Set[int] = set()
 
@@ -197,7 +199,7 @@ class AsyncEngine:
             # Log per-iteration metrics
             if self.run_logger is not None:
                 self._iteration_count += 1
-                free_blocks = len(self.scheduler.block_allocator.free_block_ids)
+                free_blocks = self.scheduler.block_allocator.num_available()
                 self.run_logger.log_iteration(
                     iteration=self._iteration_count,
                     iteration_type=batch.batch_type.value,
@@ -220,7 +222,10 @@ class AsyncEngine:
 
                 queue = self._output_queues.get(seq.seq_id)
                 if queue is not None:
-                    await queue.put(token_id)
+                    if seq.seq_id in self._include_token_metadata:
+                        await queue.put((token_id, seq.last_logit_margin))
+                    else:
+                        await queue.put(token_id)
                     # If sequence is finished, signal end of stream
                     if seq.is_finished(self.scheduler.eos_token_id):
                         if self.run_logger is not None:
@@ -234,7 +239,8 @@ class AsyncEngine:
         max_tokens: int = 16,
         prompt_token_ids: Optional[List[int]] = None,
         ignore_eos: bool = False,
-    ) -> AsyncGenerator[int, None]:
+        include_token_metadata: bool = False,
+    ) -> AsyncGenerator[Any, None]:
         """
         Submits a new generation request and returns an async generator yielding
         token IDs as they are produced by the engine.
@@ -262,6 +268,8 @@ class AsyncEngine:
 
         queue: asyncio.Queue = asyncio.Queue()
         self._output_queues[seq_id] = queue
+        if include_token_metadata:
+            self._include_token_metadata.add(seq_id)
 
         finished = False
         try:
@@ -283,3 +291,4 @@ class AsyncEngine:
                 async with self._lock:
                     self._aborted_seq_ids.add(seq_id)
             self._output_queues.pop(seq_id, None)
+            self._include_token_metadata.discard(seq_id)

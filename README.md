@@ -81,6 +81,47 @@ At saturation ($\lambda \in [3.0, 4.0]$):
 
 ---
 
+## Prefix Caching (Radix / Chain-Keyed Block Sharing)
+
+Phase 6 implements prefix caching directly in the memory allocator and continuous scheduler, distinguishing between **memory sharing** (enabling higher concurrent sequence density within the fixed KV budget) and **compute skipping** (bypassing prefill forward passes for cached prefix tokens).
+
+### Design & Mechanics
+1. **Immutable Full-Block Cache**: Only complete blocks of size 16 are cached. Blocks are keyed by `(parent_block_key, tuple(token_ids_in_block))`, using the exact token ID tuple to eliminate hash collision risks.
+2. **Cached-Free LRU Pool**: When a sequence finishes or releases a cached block, its reference count decrements to 0. Rather than returning immediately to the unkeyed free pool, it moves to an `OrderedDict`-backed LRU `cached_free` pool.
+3. **Lazy Eviction on Demand**: New allocations take unkeyed free blocks first. If plain free blocks are exhausted, the oldest block in `cached_free` is evicted (unregistered from the cache) and reused. `num_available()` accurately counts both free and cached-free blocks.
+4. **Last Prompt Token Recompute Invariant**: If a request matches prefix blocks up to prompt length $L$, the maximum usable cached tokens are capped at $\min(h, L - 1)$ rounded down to a block boundary. Recomputing at least the final prompt token ensures fresh, non-divergent next-token logits.
+5. **Decode Write Isolation**: An explicit invariant assertion ensures no decode step ever writes into a block with `ref_count > 1`. Shared prefix blocks are strictly read-only.
+
+### Invariants & Testing
+Prefix caching invariants are enforced continuously and verified via property tests:
+- **Conservation of Blocks**: $\text{Referenced Blocks} + \text{Plain Free} + \text{Cached Free} == \text{Total Pool Size}$ at every scheduling step and memory operation.
+- **Reference Count Parity**: For every block in any active sequence's block table, its reference count exactly equals the number of sequences sharing that physical block.
+- **Randomized State Machine**: Tested against a 4,000-operation randomized transition model across multiple seeds (`test_prefix_cache_randomized_state_machine`), exercising random allocate, register, acquire, release, lookup, and preemption cycles.
+- **Token Output Parity**: Greedy completions with `prefix_mode="full"` and `prefix_mode="share"` match `prefix_mode="off"` bit-identically except for occasional floating-point near-ties where top-1/top-2 logit margins are under $0.05$.
+
+### Empirical Ablation Results (Shared System Prompt, $S=64$, KV Budget = 768 tokens)
+
+The table below contrasts **`off`** (no caching), **`share`** (memory sharing only, full recompute), and **`full`** (memory sharing + prefix compute skipping):
+
+| Offered Load $\lambda$ | Mode | Throughput (tok/s) | TTFT P99 (ms) | Prefix Hit Rate | Mean Concurrency | Blocks Saved |
+| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
+| **$\lambda = 1.0$** | `off` | 22.3 tok/s | 1,824 ms | 0.0% | 1.55 | 0 |
+| | `share` | 22.2 tok/s | 436 ms | 65.5% | 1.16 | 929 |
+| | `full` | 22.2 tok/s | 456 ms | 65.5% | 1.16 | 929 |
+| **$\lambda = 2.0$** | `off` | 38.4 tok/s | 15,245 ms | 0.0% | 4.38 | 0 |
+| | `share` | 44.0 tok/s | 620 ms | 65.6% | 3.08 | 930 |
+| | `full` | 44.1 tok/s | 577 ms | 65.5% | 3.04 | 929 |
+| **$\lambda = 3.0$** (Saturation) | `off` | 38.9 tok/s | 44,239 ms | 0.0% | 4.53 | 0 |
+| | `share` | **65.6 tok/s** | **3,404 ms** | 65.8% | 7.70 | 933 |
+| | `full` | **65.6 tok/s** | **3,609 ms** | 65.6% | 7.91 | 930 |
+
+#### Insights & Findings:
+- **Memory Sharing Dominates Concurrency & Saturation Throughput**: Under the fixed 768-token budget (48 blocks), sharing a 64-token system prompt saves 4 blocks (~25%) per request. At $\lambda=3.0$, this enables mean concurrency to jump from 4.53 sequences to 7.70–7.91 sequences, lifting saturation throughput from **38.9 tok/s to 65.6 tok/s (+68.6% speedup)** and preventing massive KV starvation queues (P99 TTFT drops from 44.2 s down to 3.4 s).
+- **Compute Skipping vs Memory Sharing**: Because Qwen2.5-0.5B prefill latency on short prompts is kernel-launch bound, the throughput curves for `share` and `full` are virtually identical. The primary performance advantage of prefix caching on memory-constrained serving engines stems from **KV cache deduplication**, not skipped FLOPs.
+- **Eviction & Hit Rate Graceful Degradation**: When prefix diversity ($P$) increases beyond cache capacity, the LRU policy evicts oldest unreferenced prefix blocks smoothly without fragmentation or leaks.
+
+---
+
 ## Known Limitations
 
 1. **Model Scope**: Validated on single-GPU `Qwen/Qwen2.5-0.5B-Instruct` (FP16).
@@ -123,5 +164,5 @@ python benchmarks/reproduce_figures.py
 
 ### Run CI Unit Tests (CPU Runnable)
 ```bash
-python -m pytest tests/test_block_allocator.py tests/test_scheduler_continuous_batching.py tests/test_paged_attention_reference.py -v
+python -m pytest tests/test_block_allocator.py tests/test_scheduler_continuous_batching.py tests/test_paged_attention_reference.py tests/test_paged_attention_prefix_cache.py -v
 ```

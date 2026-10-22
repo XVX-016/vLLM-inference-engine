@@ -10,8 +10,9 @@ Design reference: vLLM's `BlockManager` / `BlockSpaceManager`.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Hashable, Optional
 
 import torch
 
@@ -154,39 +155,137 @@ class BlockAllocator:
       - O(1) allocate/free (free list, not a linear scan)
     """
 
-    def __init__(self, num_blocks: int):
+    def __init__(self, num_blocks: int, enable_prefix_cache: bool = False):
         self.num_blocks = num_blocks
+        self.enable_prefix_cache = enable_prefix_cache
         self.free_block_ids: list[int] = list(range(num_blocks))
         self.ref_counts: dict[int, int] = {}
+        self.cache: dict[tuple[Hashable | None, tuple[int, ...]], int] = {}
+        self.block_key: dict[int, tuple[Hashable | None, tuple[int, ...]]] = {}
+        self.cached_free: OrderedDict[int, None] = OrderedDict()
+        self.eviction_count = 0
 
     def can_allocate(self, n: int) -> bool:
-        return len(self.free_block_ids) >= n
+        return self.num_available() >= n
 
     def get_free_block_count(self) -> int:
         """Returns the number of unallocated blocks currently in the free list."""
-        return len(self.free_block_ids)
+        return self.num_available()
 
     @property
     def num_free_blocks(self) -> int:
-        return len(self.free_block_ids)
+        return self.num_available()
+
+    def num_available(self) -> int:
+        """Returns the number of plain or cached-free blocks available for allocation."""
+        return len(self.free_block_ids) + len(self.cached_free)
 
     def allocate(self) -> int:
-        if not self.free_block_ids:
+        if self.free_block_ids:
+            block_id = self.free_block_ids.pop()
+        elif self.enable_prefix_cache and self.cached_free:
+            block_id, _ = self.cached_free.popitem(last=False)
+            key = self.block_key.pop(block_id)
+            del self.cache[key]
+            self.eviction_count += 1
+        else:
             raise MemoryError("No free physical blocks — scheduler should have preempted before calling this.")
-        block_id = self.free_block_ids.pop()
         self.ref_counts[block_id] = 1
         return block_id
 
     def free(self, block_id: int) -> None:
+        self.release(block_id)
+
+    def acquire(self, block_id: int) -> None:
+        """Take a reference to an allocated or cached-free block."""
+        if block_id in self.cached_free:
+            del self.cached_free[block_id]
+            self.ref_counts[block_id] = 1
+            return
+        if block_id not in self.ref_counts:
+            raise ValueError(f"Block {block_id} is not allocated or cached.")
+        self.ref_counts[block_id] += 1
+
+    def register(
+        self,
+        block_id: int,
+        key: tuple[Hashable | None, tuple[int, ...]],
+    ) -> None:
+        """Publish an allocated full block under its parent-and-token key."""
+        if not self.enable_prefix_cache:
+            raise RuntimeError("Prefix caching is disabled.")
+        if block_id not in self.ref_counts:
+            raise ValueError(f"Block {block_id} must be referenced before it can be cached.")
+        normalized_key = (key[0], tuple(key[1]))
+        if not normalized_key[1]:
+            raise ValueError("A cached full block must contain at least one token.")
+        existing_block = self.cache.get(normalized_key)
+        if existing_block is not None and existing_block != block_id:
+            raise ValueError(f"Cache key {normalized_key!r} is already registered.")
+        existing_key = self.block_key.get(block_id)
+        if existing_key is not None and existing_key != normalized_key:
+            raise ValueError(f"Block {block_id} is already registered under another key.")
+        self.cache[normalized_key] = block_id
+        self.block_key[block_id] = normalized_key
+
+    def lookup_prefix(self, token_ids: list[int]) -> list[int]:
+        """Return the longest cached block chain matching the given token prefix."""
+        if not self.enable_prefix_cache:
+            return []
+
+        result: list[int] = []
+        offset = 0
+        parent_key: Hashable | None = None
+        while offset < len(token_ids):
+            matches = [
+                (key, block_id)
+                for key, block_id in self.cache.items()
+                if key[0] == parent_key
+                and tuple(token_ids[offset : offset + len(key[1])]) == key[1]
+            ]
+            if not matches:
+                break
+            key, block_id = max(matches, key=lambda item: len(item[0][1]))
+            result.append(block_id)
+            offset += len(key[1])
+            parent_key = key
+        return result
+
+    def release(self, block_id: int) -> None:
+        """Drop a reference, retaining keyed blocks in the cache when unused."""
         self.ref_counts[block_id] -= 1
         if self.ref_counts[block_id] <= 0:
             del self.ref_counts[block_id]
-            self.free_block_ids.append(block_id)
+            if self.enable_prefix_cache and block_id in self.block_key:
+                self.cached_free[block_id] = None
+            else:
+                self.free_block_ids.append(block_id)
 
     def fork(self, block_id: int) -> int:
         """Increment ref count for copy-on-write sharing (Phase 6: prefix caching)."""
+        if self.enable_prefix_cache:
+            self.acquire(block_id)
+            return block_id
         self.ref_counts[block_id] = self.ref_counts.get(block_id, 1) + 1
         return block_id
+
+    def check_invariants(self) -> None:
+        """Raise AssertionError if allocator state or cache mappings are inconsistent."""
+        referenced = set(self.ref_counts)
+        plain_free = set(self.free_block_ids)
+        cached_free = set(self.cached_free)
+        assert referenced.isdisjoint(plain_free)
+        assert referenced.isdisjoint(cached_free)
+        assert plain_free.isdisjoint(cached_free)
+        assert referenced | plain_free | cached_free == set(range(self.num_blocks))
+        assert len(self.free_block_ids) + len(self.cached_free) + len(referenced) == self.num_blocks
+        assert all(count > 0 for count in self.ref_counts.values())
+        assert len(self.cache) == len(self.block_key)
+        assert all(self.block_key.get(block_id) == key for key, block_id in self.cache.items())
+        assert all(self.cache.get(key) == block_id for block_id, key in self.block_key.items())
+        assert all(block_id in self.block_key for block_id in cached_free)
+        assert all(block_id not in referenced for block_id in cached_free)
+        assert all(block_id in referenced or block_id in cached_free for block_id in self.block_key)
 
 
 @dataclass
