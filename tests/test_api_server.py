@@ -20,6 +20,7 @@ import json
 import subprocess
 import sys
 import time
+import urllib.request
 from typing import List
 
 import httpx
@@ -30,6 +31,38 @@ from engine.memory.block_allocator import BlockAllocator
 from engine.scheduler.continuous_batching import Scheduler
 from engine.serving.api_server import create_app
 from engine.serving.async_engine import AsyncEngine
+
+
+def _wait_for_server(port: int, process: subprocess.Popen, timeout_s: float = 15.0) -> None:
+    """Poll /health until the server is ready or the process dies.
+
+    Raises RuntimeError with stderr tail if startup fails.
+    """
+    url = f"http://127.0.0.1:{port}/health"
+    deadline = time.monotonic() + timeout_s
+    last_error: Exception | None = None
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            # Process exited — drain stderr
+            stderr_text = ""
+            try:
+                _, stderr_text = process.communicate(timeout=2)
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Server process exited early (code={process.returncode}) on port {port}.\n"
+                f"STDERR:\n{stderr_text[-3000:]}"
+            )
+        try:
+            with urllib.request.urlopen(url, timeout=1.5) as response:
+                if response.status == 200:
+                    return
+        except Exception as e:
+            last_error = e
+        time.sleep(0.25)
+    raise RuntimeError(
+        f"Server on port {port} not ready after {timeout_s}s. Last error: {last_error}"
+    )
 
 
 class FastMockModelRunner:
@@ -201,8 +234,13 @@ async def test_midstream_client_disconnect_reclaims_blocks():
         [sys.executable, "-m", "uvicorn", "engine.serving.api_server:app", "--port", str(port)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        text=True,
     )
-    time.sleep(2.5)
+    try:
+        _wait_for_server(port, server_process, timeout_s=15.0)
+    except RuntimeError as exc:
+        server_process.kill()
+        pytest.fail(str(exc))
     try:
         async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{port}", timeout=10.0) as client:
             req_payload = {
@@ -232,7 +270,13 @@ async def test_midstream_client_disconnect_reclaims_blocks():
             assert metrics["free_blocks"] == metrics["total_blocks"]
     finally:
         server_process.terminate()
-        server_process.wait(timeout=5)
+        try:
+            _, stderr_out = server_process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            server_process.kill()
+            _, stderr_out = server_process.communicate(timeout=3)
+        if stderr_out and stderr_out.strip():
+            print(f"\n[test_midstream] Server stderr:\n{stderr_out[-2000:]}")
 
 
 @pytest.mark.anyio
@@ -310,8 +354,15 @@ def test_curl_and_openai_client_live_server():
         [sys.executable, "-m", "uvicorn", "engine.serving.api_server:app", "--port", str(port)],
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        text=True,
     )
-    time.sleep(2.5)
+    try:
+        _wait_for_server(port, server_process, timeout_s=15.0)
+    except RuntimeError as exc:
+        server_process.kill()
+        pytest.fail(str(exc))
+
+    stderr_tail = ""
     try:
         # 1. Test curl
         curl_payload = json.dumps({"prompt": "curl live test", "max_tokens": 3, "temperature": 0.0})
@@ -354,4 +405,52 @@ def test_curl_and_openai_client_live_server():
 
     finally:
         server_process.terminate()
-        server_process.wait(timeout=5)
+        try:
+            _, stderr_out = server_process.communicate(timeout=5)
+            stderr_tail = stderr_out or ""
+        except subprocess.TimeoutExpired:
+            server_process.kill()
+            _, stderr_out = server_process.communicate(timeout=3)
+            stderr_tail = stderr_out or ""
+        if stderr_tail.strip():
+            print(f"\n[test_curl_openai] Server stderr:\n{stderr_tail[-2000:]}")
+
+
+@pytest.mark.anyio
+async def test_oversized_then_normal_request():
+    """Item (1): Server rejects request exceeding pool capacity (400), then successfully serves normal request."""
+    total_blocks = 8  # 8 blocks * 4 tokens = 32 tokens max capacity
+    engine = build_test_engine(num_blocks=total_blocks, block_size=4)
+    app = create_app(engine)
+
+    async with app.router.lifespan_context(app):
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            # 1. Oversized request: prompt 10 words + max_tokens 30 = 40 tokens > 32 tokens capacity
+            oversized_payload = {
+                "prompt": "one two three four five six seven eight nine ten",
+                "max_tokens": 30,
+                "temperature": 0.0,
+            }
+            res_bad = await client.post("/v1/completions", json=oversized_payload)
+            assert res_bad.status_code == 400
+            err_msg = res_bad.json()["detail"]
+            assert "exceeding total pool capacity" in err_msg
+
+            # All blocks should still be free
+            allocator = engine.scheduler.block_allocator
+            assert allocator.num_available() == total_blocks
+
+            # 2. Normal request to the same server must succeed
+            normal_payload = {
+                "prompt": "normal prompt",
+                "max_tokens": 5,
+                "temperature": 0.0,
+            }
+            res_ok = await client.post("/v1/completions", json=normal_payload)
+            assert res_ok.status_code == 200
+            data = res_ok.json()
+            assert data["object"] == "text_completion"
+            assert data["usage"]["completion_tokens"] == 5
+
+            # Blocks should be freed back
+            assert allocator.num_available() == total_blocks

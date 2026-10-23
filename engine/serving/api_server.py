@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import sys
 import time
 import traceback
 from contextlib import asynccontextmanager
@@ -157,6 +158,20 @@ async def lifespan(app: FastAPI):
     global _engine
     if _engine is None:
         _engine = build_default_engine()
+    total_blocks = _engine.scheduler.block_allocator.num_blocks
+    block_size = _engine.scheduler.block_size
+    budget_tokens = total_blocks * block_size
+    startup_info = (
+        f"[SERVER STARTUP] KV budget: {budget_tokens} tokens | "
+        f"Block count: {total_blocks} blocks | Block size: {block_size} tokens | "
+        f"Command: {' '.join(sys.argv)} | "
+        f"Relevant env: VLLM_KV_MEMORY_MB={os.environ.get('VLLM_KV_MEMORY_MB')}, "
+        f"VLLM_BLOCK_SIZE={os.environ.get('VLLM_BLOCK_SIZE')}, "
+        f"VLLM_PREFIX_MODE={os.environ.get('VLLM_PREFIX_MODE')}, "
+        f"VLLM_TOTAL_BLOCKS={os.environ.get('VLLM_TOTAL_BLOCKS')}"
+    )
+    print(startup_info, flush=True)
+    logger.info(startup_info)
     _engine.start()
     logger.info("AsyncEngine started in FastAPI lifespan.")
     try:
