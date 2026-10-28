@@ -1,206 +1,157 @@
 # Paged-KV Inference Engine
 
-A lightweight, from-scratch LLM serving engine built from first principles to demonstrate **paged KV-cache memory allocation** and **iteration-level continuous batching** (mini-vLLM).
+A from-scratch, mini-vLLM-style LLM serving engine: a block-based (paged) KV-cache allocator, a Triton paged-attention kernel, an iteration-level continuous-batching scheduler with preemption, prefix caching, and an OpenAI-compatible streaming API. It runs Qwen2.5-0.5B-Instruct on a single consumer GPU and is evaluated against a static-allocation baseline under an equal KV-memory budget.
 
-> **Core Result**: Under an equal KV memory budget of 768 tokens (9.0 MiB), paged continuous batching sustains **1.2 to 1.5× the throughput** of static batching at saturation. An ablation capping paged batch size to 3 sequences matches static batching, isolating the throughput gain to memory efficiency and concurrency.
+This is a learning-and-measurement project, not a production server. The goal was to build each layer, verify it against a reference, and report what the measurements do and do not show, including the negative results.
 
----
+## Why this exists
 
-## Architecture Overview
+Static KV-cache allocation reserves memory for the longest possible sequence in every slot, so most of the reserved memory sits empty. Paging the cache into fixed-size blocks, as OS virtual memory does, lets sequences use memory in proportion to their actual length. Under a fixed KV budget that means more concurrent sequences, and in turn more throughput once the system is memory-bound.
+
+## Architecture
 
 ```mermaid
-graph TD
-    Client["Client / Load Generator"] -->|HTTP /v1/completions| FastAPIServer["FastAPI Server (api_server.py)"]
-    FastAPIServer -->|Async Queue| AsyncEngine["AsyncEngine (async_engine.py)"]
-    
-    subgraph Core Engine Execution
-        AsyncEngine --> Scheduler["Continuous Batching Scheduler"]
-        Scheduler --> BlockAllocator["Block Allocator (block_allocator.py)"]
-        BlockAllocator --> PhysicalPool["Physical KV Cache Pool (blocks x block_size)"]
-        
-        Scheduler --> PagedRunner["Model Runner (paged_runner.py)"]
-        PagedRunner --> PagedAttn["Paged Attention Integration"]
-        PagedAttn --> GPU["NVIDIA GPU (Custom Triton Kernel / Flash-Paged)"]
-    end
+flowchart LR
+    C[Client] -->|HTTP / SSE| API[api_server.py<br/>OpenAI-compatible]
+    API --> E[AsyncEngine<br/>background step loop]
+    E --> S[Scheduler<br/>waiting / running<br/>preemption]
+    S --> A[BlockAllocator<br/>free list, ref counts,<br/>prefix cache LRU]
+    S --> R[KernelPagedManualDecode<br/>model runner]
+    R --> P[(Physical block pool<br/>K/V per layer)]
+    R --> K[Triton paged-attention<br/>kernel]
+    K --> P
+    A -.owns block ids.-> P
 ```
 
-### Components
-1. **Physical Block Pool (`engine/memory/block_pool.py`)**: Pre-allocated contiguous GPU tensor representing fixed-size KV blocks (e.g. 16 tokens/block).
-2. **Block Allocator (`engine/memory/block_allocator.py`)**: Manages free/used block indices, dynamic allocation per sequence, and copy-on-write mapping.
-3. **Continuous Batching Scheduler (`engine/scheduler/continuous_batching.py`)**: Iteration-level scheduling managing request states (`WAITING`, `RUNNING`, `SWAPPED`). Interleaves chunked prefill and single-token decode steps without head-of-line blocking.
-4. **Paged Model Runner (`engine/serving/paged_runner.py`)**: Executes forward passes with Qwen2.5-0.5B-Instruct using gathered block tables.
-5. **FastAPI Serving Layer (`engine/serving/api_server.py`)**: OpenAI-compatible `/v1/completions` endpoint with streaming SSE, disconnect reclamation, and prometheus-style `/metrics`.
+| Component | Path | What it does |
+|---|---|---|
+| Block allocator | `engine/memory/block_allocator.py` | Free-list allocator over fixed-size blocks, reference counts, optional prefix cache (chain-keyed immutable blocks, LRU "cached-free" pool), `check_invariants()` |
+| Physical pool | `engine/memory/block_allocator.py` | One K and V tensor per layer, `[num_blocks, block_size, kv_heads, head_dim]`, sized from a memory budget |
+| Triton kernel | `engine/kernels/paged_attention.py` | Decode attention that reads K/V through a block table: two-pass (v1), online-softmax (v2), batched with GQA |
+| Model integration | `engine/kernels/paged_attention_integration.py` | Patches Qwen2 attention layers to write new K/V into blocks and call the kernel; prefill and decode steps |
+| Scheduler | `engine/scheduler/continuous_batching.py` | Iteration-level scheduling, admission with watermark, LIFO recompute preemption, prefix-cache admission, per-step invariant checks. The scheduler is the only component that allocates or frees blocks |
+| Async engine | `engine/serving/async_engine.py` | One background loop; model work runs in an executor so the event loop stays responsive; cancellation frees blocks at the next step |
+| API server | `engine/serving/api_server.py` | `/v1/completions` (streaming and non-streaming), `/health`, `/metrics`; rejects oversized requests with HTTP 400 |
+| Baseline | `engine/serving/naive_server.py`, `engine/baseline/` | Static-cache, request-level batching server and Phase 0 decode loops used as the control |
 
----
+## Setup
 
-## Evaluation & Empirical Results
-
-All evaluations were conducted under strict invariant controls:
-- **Equal KV Memory Budget**: Exactly 9.0 MiB of KV cache.
-  - **Naive Static Server**: 3 sequence slots × 256 Maximum Sequence Length (MSL) = **768 tokens**.
-  - **Paged Continuous Server**: 48 physical blocks × 16 tokens/block = **768 tokens**.
-- **Model**: `Qwen/Qwen2.5-0.5B-Instruct` (FP16 weights: 959.2 MiB in-process memory).
-- **Environment**: NVIDIA GeForce RTX 3050 Laptop GPU (4 GB VRAM), AC Power connected, Windows Best Performance scheme.
-- **Sysmem Policy**: NVIDIA Control Panel 3D Settings set to *"CUDA - Sysmem Fallback Policy: Prefer No Sysmem Fallback"*.
-
-### Throughput & Goodput vs. Offered Load
-Below saturation ($\lambda \le 2.0$), both systems are equal: throughput matches offered load, and P99 Time-To-First-Token (TTFT) remains under 0.45 s.
-
-At saturation ($\lambda \in [3.0, 4.0]$):
-- **Naive Static Batching** plateaus at **43.4 to 48.5 tok/s** due to head-of-line blocking and internal slot fragmentation.
-- **Paged Ablation (`max_batch_size=3`)** plateaus at **40.0 to 43.4 tok/s**, matching the static server and proving that concurrency limits explain the ceiling.
-- **Paged Continuous (Unbounded)** breaks through to **56.4 to 65.6 tok/s** (**1.2 to 1.5× higher throughput** across seeds).
-
-| Arrival Rate $\lambda$ | Seed | Offered Load | Naive Static | Paged Ablation (BS=3) | Paged Unbounded | Speedup Range |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **0.5** | 42–44 | ~10–11 tok/s | ~10.7 tok/s | — | ~10.7 tok/s | 1.0× (unsat.) |
-| **1.0** | 42–44 | ~19–23 tok/s | ~21.4 tok/s | — | ~21.4 tok/s | 1.0× (unsat.) |
-| **1.5** | 42 | 33.54 tok/s | 33.04 tok/s | 33.22 tok/s | 33.23 tok/s | 1.0× |
-| **1.5** | 43 | 28.77 tok/s | 28.43 tok/s | 28.57 tok/s | 28.55 tok/s | 1.0× |
-| **2.0** | 42 | 44.72 tok/s | 43.44 tok/s | 43.94 tok/s | 44.15 tok/s | 1.0× |
-| **2.0** | 43 | 38.36 tok/s | 37.88 tok/s | 37.95 tok/s | 37.90 tok/s | 1.0× |
-| **3.0** | 42 | 67.08 tok/s | 48.55 tok/s | 41.80 tok/s | **65.62 tok/s** | **1.35× (seed 42)** |
-| **3.0** | 43 | 57.54 tok/s | 47.91 tok/s | 39.97 tok/s | **56.43 tok/s** | **1.18× (seed 43)** |
-| **4.0** | 42 | 89.44 tok/s | 44.46 tok/s | 43.38 tok/s | **64.78 tok/s** | **1.46× (seed 42)** |
-| **4.0** | 43 | 76.72 tok/s | 43.40 tok/s | 42.00 tok/s | **59.22 tok/s** | **1.36× (seed 43)** |
-
-### Latency (TTFT P99)
-- Below saturation ($\lambda \le 2.0$), both naive and paged servers achieve P99 TTFT between **0.21 s and 0.45 s**.
-- At $\lambda=4.0$, Naive P99 TTFT spikes to **2.05 – 2.30 s**, while Paged Unbounded sustains **0.65 – 0.68 s** (a **3 to 3.5× latency improvement**).
-
-### Decode Step-Time Benchmark (Interleaved ABAB Blocks after 30s Warmup)
-
-| Batch Size | Plain HF Median | Paged Median | Speedup (Paged / Plain HF) |
-| :---: | :---: | :---: | :---: |
-| **BS = 1** | 42.93 ms | 40.83 ms | **1.05×** |
-| **BS = 3** | 43.75 ms | 46.99 ms | **0.93×** |
-| **BS = 4** | 43.94 ms | 48.91 ms | **0.90×** |
-| **BS = 8** | 45.35 ms | 60.78 ms | **0.75×** |
-
-> **Analysis**: Single-step decode time is roughly flat (~45 ms) for Plain HF across batch sizes 1 to 8, which explains why aggregate throughput scales linearly with concurrency. Paged attention is slightly slower at higher batch sizes (0.75× at BS=8) due to Python scheduling overhead and block-table metadata dispatch. Eliminating this step-time gap via CUDA Graphs or C++ bindings is the primary architectural headroom.
-
----
-
-## Prefix Caching (Radix / Chain-Keyed Block Sharing)
-
-Phase 6 implements prefix caching directly in the memory allocator and continuous scheduler, distinguishing between **memory sharing** (enabling higher concurrent sequence density within the fixed KV budget) and **compute skipping** (bypassing prefill forward passes for cached prefix tokens).
-
-### Design & Mechanics
-1. **Immutable Full-Block Cache**: Only complete blocks of size 16 are cached. Blocks are keyed by `(parent_block_key, tuple(token_ids_in_block))`, using the exact token ID tuple to eliminate hash collision risks.
-2. **Cached-Free LRU Pool**: When a sequence finishes or releases a cached block, its reference count decrements to 0. Rather than returning immediately to the unkeyed free pool, it moves to an `OrderedDict`-backed LRU `cached_free` pool.
-3. **Lazy Eviction on Demand**: New allocations take unkeyed free blocks first. If plain free blocks are exhausted, the oldest block in `cached_free` is evicted (unregistered from the cache) and reused. `num_available()` accurately counts both free and cached-free blocks.
-4. **Last Prompt Token Recompute Invariant**: If a request matches prefix blocks up to prompt length $L$, the maximum usable cached tokens are capped at $\min(h, L - 1)$ rounded down to a block boundary. Recomputing at least the final prompt token ensures fresh, non-divergent next-token logits.
-5. **Decode Write Isolation**: An explicit invariant assertion ensures no decode step ever writes into a block with `ref_count > 1`. Shared prefix blocks are strictly read-only.
-
-### Invariants & Testing
-Prefix caching invariants are enforced continuously and verified via property tests:
-- **Conservation of Blocks**: $\text{Referenced Blocks} + \text{Plain Free} + \text{Cached Free} == \text{Total Pool Size}$ at every scheduling step and memory operation.
-- **Reference Count Parity**: For every block in any active sequence's block table, its reference count exactly equals the number of sequences sharing that physical block.
-- **Randomized State Machine**: Tested against a 4,000-operation randomized transition model across multiple seeds (`test_prefix_cache_randomized_state_machine`), exercising random allocate, register, acquire, release, lookup, and preemption cycles.
-- **Token Output Parity**: Greedy completions with `prefix_mode="full"` and `prefix_mode="share"` match `prefix_mode="off"` bit-identically except for occasional floating-point near-ties where top-1/top-2 logit margins are under $0.05$.
-
-### Empirical Results & Invariant Analysis (Phase 6 Matrix)
-
-![Prefix Caching 4-Panel Results](benchmarks/results/prefix_cache/prefix_cache_4panel.png)
-
-#### 1. Core Throughput & Dose-Response Scaling (768-Token Budget)
-Across all runs, **throughput gains strictly scale with prefix sharing density**, exhibiting a clear monotonic dose-response relationship:
-
-| Profile ($S=64$, Budget = 768T) | Offered Load $\lambda$ | `off` Throughput | `share` Throughput | `full` Throughput | Measured Hit Rate | Throughput Speedup |
-|:---|:---:|:---:|:---:|:---:|:---:|:---:|
-| **P = 1** (High sharing) | $\lambda=3.0$ | 38.9 tok/s (s42) / 39.1 (s43) | 65.6 tok/s (s42) / 56.5 (s43) | 65.6 tok/s (s42) / 56.5 (s43) | **49.8%** | **1.45–1.69×** |
-| | $\lambda=4.0$ | 38.8 tok/s (s42) / 41.7 (s43) | 68.5 tok/s (s42) / 68.7 (s43) | 65.8 tok/s (s42) / 67.9 (s43) | **49.9%** | **1.63–1.77×** |
-| **P = 4** (Moderate sharing) | $\lambda=3.0$ | 36.5 tok/s (s42) / 40.0 (s43) | 55.5 tok/s (s42) / 54.1 (s43) | 55.2 tok/s (s42) / 54.6 (s43) | **48.3%** | **1.35–1.52×** |
-| | $\lambda=4.0$ | 36.7 tok/s (s42) / 36.1 (s43) | 56.6 tok/s (s42) / 54.4 (s43) | 55.0 tok/s (s42) / 57.8 (s43) | **48.4%** | **1.51–1.60×** |
-| **P = 16** (Eviction stress test) | $\lambda=3.0$ | 38.9 tok/s (s42) / 39.0 (s43) | 41.6 tok/s (s42) / 42.2 (s43) | 41.1 tok/s (s42) / 42.0 (s43) | **4.0%** | **1.06–1.08×** |
-| | $\lambda=4.0$ | 38.7 tok/s (s42) / 41.1 (s43) | 42.6 tok/s (s42) / 42.3 (s43) | 41.3 tok/s (s42) / 42.8 (s43) | **4.1%** | **1.03–1.10×** |
-| **Control** (Zero-sharing, $P=200$) | $\lambda=3.0$ | 26.7 tok/s | 28.4 tok/s | 26.0 tok/s | **0.0%** | **1.00× (Within noise)** |
-
-- **Hit-Rate Disambiguation**: For P=4, the measured hit rate is **48.3%** out of a theoretical shareable ceiling of **50.6%** ($48\text{ shared tokens} / 95\text{ avg tokens}$), achieving **95.4% cache efficiency**. For P=16 under the 768-token budget, the measured hit rate collapses to **4.0%** (**7.9% efficiency**) because 16 active prefixes require $16 \times 64 = 1,024$ tokens, exceeding the 768-token physical capacity and causing continuous LRU eviction thrashing.
-- **Zero-Sharing Control Overhead**: In the $P=200$ control (where unique prefix headers guarantee a clean 0.0% hit rate by construction), throughputs for `off`, `share`, and `full` are indistinguishable within 2-seed noise (26.7, 28.4, 26.0 tok/s), confirming zero runtime penalty when prefixes cannot be shared.
-
-#### 2. Fair Caching Scaling: P=16 at Higher Budgets
-When the pool budget is expanded to comfortably hold all 16 distinct system prompts, cache thrashing vanishes and throughput scales proportionally:
-
-| KV Budget | Mode | Throughput (tok/s) | Hit Rate | Evictions | Preemptions | TTFT P50 (s) | Speedup vs `off` |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **768 Tokens** (Eviction Stress) | `off` | 38.9 tok/s | 0.0% | 0 | 23 | 24.04 s | 1.00× |
-| | `share` | 41.6 tok/s | 4.0% | 1,528 | 26 | 21.58 s | 1.07× |
-| | `full` | 41.1 tok/s | 3.7% | 1,545 | 24 | 21.37 s | 1.06× |
-| **2048 Tokens** | `off` | 45.0 tok/s | 0.0% | 0 | 8 | 7.61 s | 1.00× |
-| | `share` | 54.1 tok/s | 25.1% | 509 | 11 | 4.27 s | **1.20×** |
-| | `full` | 52.9 tok/s | 22.9% | 523 | 15 | 5.08 s | **1.18×** |
-| **4096 Tokens** (Full Residency) | `off` | 49.5 tok/s | 0.0% | 0 | 10 | 4.75 s | 1.00× |
-| | `share` | 67.1 tok/s | 49.7% | 190 | 0 | 0.57 s | **1.36×** |
-| | `full` | 66.3 tok/s | 49.8% | 186 | 0 | 0.46 s | **1.34×** |
-
-#### 3. Anatomy of the TTFT Disparity: Memory Effect vs Compute Skipping
-Under long system prefixes ($P=1, S=512$, budget = 4096 tokens, $\lambda \in \{0.5, 1.0\}$), naive execution reported massive TTFT gaps between `off` and `share`/`full`:
-- At $\lambda=0.5$: `off` TTFT P50 = **2.36–7.34 s** (up to 8 preemptions), while `share`/`full` TTFT P50 = **0.16–0.19 s** (0 preemptions).
-- At $\lambda=1.0$: `off` TTFT P50 = **69.98–83.53 s** (up to 13 preemptions), while `share`/`full` TTFT P50 = **0.16–0.17 s** (0 preemptions).
-
-**The Root Cause is Memory Sharing, Not Compute FLOPs**:
-Because each 512-token prefix occupies 32 blocks, unshared execution (`off`) quickly exhausts the 4096-token pool (which holds only 8 concurrent full-length requests), forcing severe queueing delays and repeated preemption cycles. Prefix sharing (`share`) amortizes the 32 blocks across all requests, reducing active memory consumption by over $85\%$, completely eliminating preemptions, and maintaining near-instantaneous queue clearance.
-
-**Prefill Compute-Skip Profiling**:
-In-process GPU microbenchmarking isolating raw forward math (with an isolated 481-token prefix and an 8-token suffix) demonstrates:
-- **Full prefill (489 tokens)**: $53.84\text{ ms}$ (launch-bound on RTX Laptop GPU)
-- **Suffix prefill (8 tokens, 481 cached)**: $46.31\text{ ms}$
-- **True raw compute saving**: **$7.53\text{ ms}$ ($1.16\times$ speedup)**.
-
-Because single-step forward passes at this parameter scale are launch-bound (~45–50 ms per forward step), raw prefill compute skipping saves only tens of milliseconds. The multi-second TTFT reductions observed in live serving are entirely queueing delay mitigations afforded by memory deduplication.
-
-#### 4. Hardware Telemetry & Thermal Clocks
-Logged GPU graphics clocks across all matrix runs:
-- `off` runs: Mean $1,038.9\text{ MHz}$ (median $795\text{ MHz}$, range $210–2,565\text{ MHz}$, $n=1,679$)
-- `share` runs: Mean $1,099.0\text{ MHz}$ (median $810\text{ MHz}$, range $210–2,565\text{ MHz}$, $n=1,373$)
-- `full` runs: Mean $937.0\text{ MHz}$ (median $600\text{ MHz}$, range $210–2,565\text{ MHz}$, $n=1,395$)
-
-Latin-square mode interleaving within each $(profile, \lambda, seed)$ cell successfully averaged thermal drift across modes. Minor throttling into lower P-states occurred during long saturation runs without creating systematic bias.
-
----
-
-## Known Limitations
-
-1. **Model Scope**: Validated on single-GPU `Qwen/Qwen2.5-0.5B-Instruct` (FP16).
-2. **Sampling**: Supports greedy decoding (`temperature=0.0`); top-p / top-k sampling kernels are omitted.
-3. **Preemption Strategy**: Memory exhaustion triggers recompute preemption (aborting tail tokens and re-running prefill upon block availability) rather than host-memory swapping.
-4. **Hardware**: Single laptop GPU setup (RTX 3050 Laptop GPU, 4 GB VRAM); multi-GPU tensor parallelism is not implemented.
-5. **Trace Workload**: Synthetic Poisson arrival traces generated from random prompts and target lengths.
-
----
-
-## The Debugging Story
-
-Building this engine exposed several subtle systems bugs:
-1. **The Phantom Memory Leak**: Under continuous batching, memory steadily expanded across requests until hitting OOM. Four hypotheses failed: tensor reference cycles, block table leaks, allocator double-frees, and Triton cache fragmentation. The actual root cause was a one-line PyTorch behavior: executing inside `@torch.inference_mode()` on the request runner loop prevented autograd tracking, but sub-calls invoked during prefill reset the inference context. Wrapping all engine step routines in explicit inference mode permanently flattened memory to 959–975 MiB.
-2. **The Naive Tokenizer Concurrency Race**: Under Poisson load, the naive server experienced intermittent `500 Internal Server Errors`. The runner thread was calling mutating tokenizer methods (`tokenizer(prompts, ...)` and `set_truncation_and_padding()`) concurrently with the FastAPI request handler. The fix refactored `NaiveHFModelRunner` to take pre-tokenized IDs from the async handler and build left-padded tensors purely with `torch.full`, driving server failure rates to exactly zero.
-3. **Preemption Variance Across Seeds**: At $\lambda=4.0$, seed 42 experienced 37 preemptions while seed 43 experienced 0. Deeper trace analysis revealed that seed 42 contained a 142-token burst prompt with a cluster of 16 arrivals within a 2.0-second window, exhausting the 768-token budget temporarily and forcing preemption, whereas seed 43's arrivals were more evenly spaced.
-
----
-
-## Setup & Reproduction
-
-### Prerequisites
-- Python 3.10 or 3.11
-- NVIDIA GPU with CUDA 12.x (or CPU for unit tests)
+Developed on Windows 11 with an NVIDIA RTX 4060 Laptop GPU (8 GB), Python 3.10, PyTorch 2.x with CUDA 12.4, `triton-windows`, and `transformers` 5.x. Linux or WSL2 with upstream Triton should also work. Anything past the CPU tests needs a CUDA GPU.
 
 ```bash
-git clone https://github.com/your-username/vLLM-inference-engine.git
-cd vLLM-inference-engine
-python -m venv .venv
-source .venv/bin/activate  # Or .venv\Scripts\activate on Windows
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-### Reproduce Evaluation Figures
-To reproduce the consolidated evaluation figure from the validated experimental runs:
+Run the server (see `engine/serving/api_server.py` for the budget and mode environment variables):
+
 ```bash
-python benchmarks/reproduce_figures.py
-# Generated plot saved to: results/serving_evaluation_consolidated.png
+uvicorn engine.serving.api_server:app --port 8000
+curl -s localhost:8000/v1/completions -H "Content-Type: application/json" \
+  -d '{"prompt": "The capital of France is", "max_tokens": 16, "temperature": 0}'
 ```
 
-### Run CI Unit Tests (CPU Runnable)
+The official `openai` Python client works unmodified against `/v1`.
+
+## Testing
+
+Every layer was checked against a simpler reference before the next was built.
+
 ```bash
-python -m pytest tests/test_block_allocator.py tests/test_scheduler_continuous_batching.py tests/test_paged_attention_reference.py tests/test_paged_attention_prefix_cache.py -v
+pytest tests/test_block_allocator.py tests/test_scheduler_continuous_batching.py \
+       tests/test_paged_attention_prefix_cache.py -q          # CPU only
+pytest tests/test_paged_attention_reference.py -q             # needs CUDA for the Triton cases
+pytest tests/test_real_gpu_three_tests.py -q                  # real model, needs a GPU
+python -m scripts.diagnose_kv_equivalence                     # cached K/V vs recomputed K/V
 ```
+
+- **Allocator:** a fixed-seed randomized state-machine test (thousands of allocate/register/acquire/release/lookup operations against a reference model) with `check_invariants()` after every operation.
+- **Scheduler:** fake-model tests for leaks, slot reuse, preemption under a tiny pool, prefix sharing, and eviction; a debug mode checks block conservation and reference counts every iteration.
+- **Kernel:** compared to a PyTorch reference on randomized, shuffled, non-contiguous block layouts, including GQA ratios of 1, 2, 4 and 7, partial last blocks, 2048-token sequences, and large-magnitude scores.
+- **End to end:** greedy output compared to Hugging Face on a real model, with the first divergence and the top-1/top-2 logit margin reported for any mismatch.
+
+## Results
+
+All numbers are from one laptop GPU, one 0.5B model, greedy decoding, and synthetic Poisson traces with fixed output lengths. Throughput and latency numbers depend on the trace. Treat the ranges as the finding, not any single run.
+
+### Correctness
+
+- Cached K/V blocks are bitwise identical to freshly computed K/V (max absolute difference 0 across all 24 layers).
+- Paged decode matches Hugging Face greedy output except at fp16 near-ties. Over 64 tokens on 5 prompts, 3 matched exactly. The other 2 diverged at steps 13 and 53 where the top-1/top-2 logit margin was about 0.03, and teacher-forced logit differences stayed within fp16 noise. In batched, preempted and prefix-cached runs, every mismatch had a near-tie margin.
+
+### Kernel
+
+- Correct against the reference across the cases listed above.
+- Compared with PyTorch's memory-efficient SDPA on contiguous K/V with GQA heads pre-expanded: roughly even at batch sizes 1 to 4 (0.8 to 1.4x) and 2.3 to 2.7x faster at batch 16 and above. A GQA-native kernel reads about 7x fewer K/V bytes than the expanded baseline, so part of this gain is memory traffic rather than a better algorithm. `[TODO: rerun this comparison with the L2 cache flushed so all rows use one methodology.]`
+- Peak effective bandwidth with L2 flushed: about 81 GB/s at batch 32 and sequence length 2048, roughly 36% of the 227 GB/s this GPU achieves for a plain 256 MB copy. There is headroom: the kernel launches one program per query head, so each KV block is read once per query head in its GQA group.
+- At small batch sizes the kernel is limited by occupancy and per-step overhead, not bandwidth.
+
+### Serving at equal KV budget
+
+Both servers get the same 9 MiB KV budget (768 tokens): the static server has 3 slots of 256 tokens, and the paged server has 48 blocks of 16 tokens. Both run the same Hugging Face forward under `torch.inference_mode()`.
+
+| | Static batching | Paged, capped at 3 concurrent | Paged |
+|---|---|---|---|
+| Throughput at saturation, λ = 3 to 4 (tok/s) | 43 to 49 | 40 to 43 | 56 to 66 |
+| TTFT P99, λ = 3 to 4 (s) | 1.0 to 2.3 | 1.2 to 2.5 | 0.4 to 0.7 |
+
+- Below saturation (λ of 2 req/s and under) the systems are indistinguishable: throughput matches offered load and tail latency is a fraction of a second.
+- The saturation gap is **about 1.2 to 1.5x** across two seeds. It comes from concurrency: capping the paged engine at the static server's 3 concurrent sequences removes the gain.
+- Decode step time is roughly flat from batch 1 to 8 on this setup (around 45 ms, launch-bound), so throughput tracks the number of concurrent sequences. The paged runner is slower than plain Hugging Face at batch 3 to 8 (0.93, 0.90 and 0.75x), which is one reason the gain is less than the concurrency ratio.
+- Seeds are reported separately in `benchmarks/results/`. Several points sit close to the saturation boundary, where run-to-run variation is large.
+
+### Prefix caching
+
+Chain-keyed, immutable full blocks; freed cached blocks go to an LRU pool and are evicted only when needed; at least one prompt token is always recomputed. Budget 768 tokens unless noted.
+
+| Workload | Saturated throughput gain (share / off) | First-admission hit rate (measured / ceiling) |
+|---|---|---|
+| 1 shared 64-token prefix | 1.24 to 1.28x | 55.8% / 56.1% |
+| 4 shared prefixes | 1.07 to 1.48x across 4 runs (inconclusive) | 48.3% / 50.6% |
+| 16 prefixes, pool thrashes (768 tokens) | 1.03 to 1.10x | 4.0% / `[TODO: per-profile ceiling]` |
+| 16 prefixes, 4096-token pool | 1.36x (one seed, at offered load, so a lower bound) | about 50% |
+| 200 unique prefixes (control, 0% hits) | `[TODO: rerun at a saturating load]` | 0% by construction |
+
+- The gain scales with how much memory sharing saves and shrinks when the cache thrashes.
+- Skipping the shared prefill computation (`full` mode) gave **no measurable benefit** over memory sharing alone (`share`). On this launch-bound 0.5B model a 489-token prefill costs about as much as a decode step (about 54 ms), and an 8-token suffix forward is not faster.
+- An early version of these experiments reported 1.7x and a 485x TTFT improvement. Both were artifacts: the first compared a throttled plateau against an offered-load-capped one, and the second compared queueing delay under overload. They are retracted here and kept in the notes below.
+
+## Bugs found and how they were found
+
+**Autograd left enabled in the baseline server.** The first version of the static baseline lost most requests after about ten batches with CUDA out-of-memory. Per-batch `memory_allocated` climbed from 957 MiB to about 14 GiB. Four single-change variants (`logits_to_keep=1`, `empty_cache()` between batches, a cache-overflow guard, and a one-batch log) all failed identically, which ruled out logits size, allocator caching and cache overflow. Wrapping the batch in `torch.inference_mode()` held memory flat at about 965 MiB across 52 batches with zero failures. The graph for every forward pass had been retained for a backward that never ran.
+
+**Fast tokenizer is not thread-safe.** Rare HTTP 500s on the baseline came from `RuntimeError: Already borrowed`: the request handler and the executor thread both mutated one tokenizer's padding state. Fix: tokenize once in the handler and build padded batches from token ids.
+
+**Admission mismatch.** A request needing 38 blocks reached a 37-block pool and crashed the engine loop. The handler now rejects oversized requests with HTTP 400, the engine fails a single offending sequence instead of exiting, and every benchmark run asserts that the server's reported block count equals the run's intended capacity.
+
+**Measurement pitfalls that nearly produced wrong claims:** an SDPA baseline that silently used the math fallback; a bandwidth figure inflated by L2 cache residency; throughput that equalled offered load being read as a plateau; TTFT percentiles under overload that measured run length; a "no-sharing" control that shared first blocks through a small prompt vocabulary.
+
+## Limitations
+
+- One small model (0.5B), one laptop GPU, greedy decoding only. At this size the forward pass is launch-bound, which hides compute savings and compresses gains from batching. Results may differ substantially on larger, memory-bound models.
+- Preemption is recompute-only; there is no swap-to-CPU path.
+- Prefill is not batched with decode and runs through the Hugging Face path.
+- Traces are synthetic with fixed output lengths; real workloads with early stopping, long-tail lengths, or multi-turn reuse were not evaluated.
+- The kernel is correct but not tuned to the bandwidth limit; a GQA-grouped launch and FlashDecoding-style sequence splitting are the obvious next steps.
+- GPU clocks varied during long benchmark sessions on a laptop. Mode order was interleaved within each cell, but the spread between seeds is large for several points.
+
+## Repository layout
+
+```
+engine/            allocator, kernels, scheduler, serving
+benchmarks/        workload traces, load generator, serving and prefix-cache sweeps, figures
+tests/             unit, invariant, kernel and real-GPU tests
+scripts/           diagnostics (K/V equivalence, pool sizing, Triton check)
+```
+
+## References
+
+- Kwon et al., *Efficient Memory Management for Large Language Model Serving with PagedAttention* (SOSP 2023).
+- Yu et al., *Orca: A Distributed Serving System for Transformer-Based Generative Models* (OSDI 2022).
+- Dao et al., *FlashAttention* (2022), for the online-softmax formulation used in the kernel.
+
+## License
+
+This project is released under the [MIT License](LICENSE). Copyright (c) 2026 [Tanmmay kanahaiya].
+
+Third-party components (PyTorch, Hugging Face Transformers, Triton, FastAPI and others) are used under their own licenses. Qwen2.5-0.5B-Instruct model weights are distributed under their own license terms; check the model card before redistributing them or using them commercially.
