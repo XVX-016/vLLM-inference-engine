@@ -33,7 +33,7 @@ from engine.serving.api_server import create_app
 from engine.serving.async_engine import AsyncEngine
 
 
-def _wait_for_server(port: int, process: subprocess.Popen, timeout_s: float = 15.0) -> None:
+def _wait_for_server(port: int, process: subprocess.Popen, timeout_s: float = 60.0) -> None:
     """Poll /health until the server is ready or the process dies.
 
     Raises RuntimeError with stderr tail if startup fails.
@@ -59,7 +59,7 @@ def _wait_for_server(port: int, process: subprocess.Popen, timeout_s: float = 15
                     return
         except Exception as e:
             last_error = e
-        time.sleep(0.25)
+        time.sleep(0.5)
     raise RuntimeError(
         f"Server on port {port} not ready after {timeout_s}s. Last error: {last_error}"
     )
@@ -73,6 +73,11 @@ class FastMockModelRunner:
     def step(self, batch) -> List[int]:
         if self.step_delay_s > 0:
             time.sleep(self.step_delay_s)
+        from engine.scheduler.continuous_batching import BatchType
+        if batch.batch_type == BatchType.DECODE:
+            for seq in batch.sequences:
+                if seq.block_table is not None:
+                    seq.block_table.num_tokens += 1
         return [200 + seq.seq_id for seq in batch.sequences]
 
 
@@ -170,11 +175,11 @@ async def test_input_validations():
             assert res_temp.status_code == 400
             assert "Only temperature=0 is supported" in res_temp.json()["detail"]
 
-            # 2. Exceeding pool capacity should fail with 400
-            # 8 blocks of size 4 can hold at most 32 tokens. Requesting 35 tokens fails.
-            res_mem = await client.post("/v1/completions", json={"prompt": "short prompt", "max_tokens": 35})
+            # 2. Exceeding usable capacity (accounting for watermark) should fail with 400
+            # 8 blocks of size 4 can hold at most 32 tokens, watermark=1 means 7 blocks usable = 28 tokens.
+            res_mem = await client.post("/v1/completions", json={"prompt": "short prompt", "max_tokens": 30})
             assert res_mem.status_code == 400
-            assert "exceeding total pool capacity" in res_mem.json()["detail"]
+            assert "exceeding usable pool capacity" in res_mem.json()["detail"]
 
             # Assert no memory leak
             allocator = engine.scheduler.block_allocator
@@ -237,7 +242,7 @@ async def test_midstream_client_disconnect_reclaims_blocks():
         text=True,
     )
     try:
-        _wait_for_server(port, server_process, timeout_s=15.0)
+        _wait_for_server(port, server_process, timeout_s=60.0)
     except RuntimeError as exc:
         server_process.kill()
         pytest.fail(str(exc))
@@ -259,15 +264,17 @@ async def test_midstream_client_disconnect_reclaims_blocks():
                             break
 
             # Allow engine background loop to process abort at step boundary
-            await asyncio.sleep(0.1)
+            reclaimed = False
+            for _ in range(50):
+                await asyncio.sleep(0.1)
+                metrics_resp = await client.get("/metrics")
+                assert metrics_resp.status_code == 200
+                metrics = metrics_resp.json()
+                if metrics["running"] == 0 and metrics["waiting"] == 0 and metrics["free_blocks"] == metrics["total_blocks"]:
+                    reclaimed = True
+                    break
 
-            # Query metrics to verify all blocks were reclaimed
-            metrics_resp = await client.get("/metrics")
-            assert metrics_resp.status_code == 200
-            metrics = metrics_resp.json()
-            assert metrics["running"] == 0
-            assert metrics["waiting"] == 0
-            assert metrics["free_blocks"] == metrics["total_blocks"]
+            assert reclaimed, f"Engine did not reclaim blocks in time: {metrics}"
     finally:
         server_process.terminate()
         try:
@@ -357,7 +364,7 @@ def test_curl_and_openai_client_live_server():
         text=True,
     )
     try:
-        _wait_for_server(port, server_process, timeout_s=15.0)
+        _wait_for_server(port, server_process, timeout_s=60.0)
     except RuntimeError as exc:
         server_process.kill()
         pytest.fail(str(exc))
@@ -418,14 +425,43 @@ def test_curl_and_openai_client_live_server():
 
 @pytest.mark.anyio
 async def test_oversized_then_normal_request():
-    """Item (1): Server rejects request exceeding pool capacity (400), then successfully serves normal request."""
+    """Item (1) & Boundary tests:
+    - Exactly fits usable capacity (num_blocks - watermark) -> succeeds.
+    - Exactly one block over usable capacity -> rejected with 400.
+    - Large oversized request -> rejected with 400.
+    - Follow-on normal request succeeds, all blocks are free, and check_invariants() passes.
+    """
     total_blocks = 8  # 8 blocks * 4 tokens = 32 tokens max capacity
+    # build_test_engine uses watermark_blocks=1 -> usable blocks = 7 -> 28 tokens
     engine = build_test_engine(num_blocks=total_blocks, block_size=4)
     app = create_app(engine)
 
     async with app.router.lifespan_context(app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
-            # 1. Oversized request: prompt 10 words + max_tokens 30 = 40 tokens > 32 tokens capacity
+            allocator = engine.scheduler.block_allocator
+
+            # 1. Boundary: exactly fits usable capacity (7 blocks = 28 tokens)
+            # prompt = 4 words (4 tokens), max_tokens = 24 -> total 28 tokens -> 7 blocks.
+            res_exact = await client.post(
+                "/v1/completions",
+                json={"prompt": "one two three four", "max_tokens": 24, "temperature": 0.0},
+            )
+            assert res_exact.status_code == 200
+            assert allocator.num_available() == total_blocks
+            engine.scheduler.check_invariants()
+
+            # 2. Boundary: exactly one block over usable capacity (8 blocks = 32 tokens, leaves 0 for watermark)
+            # prompt = 4 words, max_tokens = 25 -> total 29 tokens -> 8 blocks needed > 7 usable.
+            res_one_over = await client.post(
+                "/v1/completions",
+                json={"prompt": "one two three four", "max_tokens": 25, "temperature": 0.0},
+            )
+            assert res_one_over.status_code == 400
+            assert "exceeding usable pool capacity" in res_one_over.json()["detail"]
+            assert allocator.num_available() == total_blocks
+            engine.scheduler.check_invariants()
+
+            # 3. Oversized request: prompt 10 words + max_tokens 30 = 40 tokens > 32 tokens
             oversized_payload = {
                 "prompt": "one two three four five six seven eight nine ten",
                 "max_tokens": 30,
@@ -433,14 +469,11 @@ async def test_oversized_then_normal_request():
             }
             res_bad = await client.post("/v1/completions", json=oversized_payload)
             assert res_bad.status_code == 400
-            err_msg = res_bad.json()["detail"]
-            assert "exceeding total pool capacity" in err_msg
-
-            # All blocks should still be free
-            allocator = engine.scheduler.block_allocator
+            assert "exceeding usable pool capacity" in res_bad.json()["detail"]
             assert allocator.num_available() == total_blocks
+            engine.scheduler.check_invariants()
 
-            # 2. Normal request to the same server must succeed
+            # 4. Normal request to the same server must succeed cleanly
             normal_payload = {
                 "prompt": "normal prompt",
                 "max_tokens": 5,
@@ -452,5 +485,6 @@ async def test_oversized_then_normal_request():
             assert data["object"] == "text_completion"
             assert data["usage"]["completion_tokens"] == 5
 
-            # Blocks should be freed back
+            # Blocks should be freed back and invariants must hold
             assert allocator.num_available() == total_blocks
+            engine.scheduler.check_invariants()

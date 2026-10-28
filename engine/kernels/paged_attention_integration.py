@@ -283,27 +283,47 @@ class KernelPagedManualDecode:
         skip_blocks: int = 0,
     ) -> None:
         """
-        Copies prefill K/V tensors into the PhysicalBlockPool.
+        Copies prefill K/V tensors into the PhysicalBlockPool using vectorized index_copy_.
 
         The scheduler has already allocated physical blocks and set
         block_table.num_tokens = prompt_len before calling prefill().
         This method ONLY writes tensor data — it never calls allocate().
         """
-        for t in range(skip_blocks * self.block_size, prompt_len):
-            logical_block_idx = t // self.block_size
-            physical_block_id = block_table.physical_block_ids[logical_block_idx]
-            offset = t % self.block_size
+        start_token = skip_blocks * self.block_size
+        if start_token >= prompt_len:
+            return
 
-            for layer_idx in range(self.num_layers):
-                if hasattr(pkv, "layers"):
-                    k_tok = pkv.layers[layer_idx].keys[:, :, t, :]  # [1, num_kv_heads, head_dim]
-                    v_tok = pkv.layers[layer_idx].values[:, :, t, :]
-                else:
-                    k_tok = pkv[layer_idx][0][:, :, t, :]
-                    v_tok = pkv[layer_idx][1][:, :, t, :]
+        total_blocks = (prompt_len + self.block_size - 1) // self.block_size
+        blocks_to_write = total_blocks - skip_blocks
+        if blocks_to_write <= 0:
+            return
 
-                self.pool.k_cache[layer_idx][physical_block_id, offset] = k_tok.squeeze(0).to(self.dtype)
-                self.pool.v_cache[layer_idx][physical_block_id, offset] = v_tok.squeeze(0).to(self.dtype)
+        phys_block_ids = torch.tensor(
+            block_table.physical_block_ids[skip_blocks:total_blocks],
+            dtype=torch.long,
+            device=self.device,
+        )
+
+        tokens_to_copy = prompt_len - start_token
+        pad_tokens = blocks_to_write * self.block_size - tokens_to_copy
+
+        for layer_idx in range(self.num_layers):
+            if hasattr(pkv, "layers"):
+                k_src = pkv.layers[layer_idx].keys[0, :, start_token:prompt_len, :].permute(1, 0, 2)
+                v_src = pkv.layers[layer_idx].values[0, :, start_token:prompt_len, :].permute(1, 0, 2)
+            else:
+                k_src = pkv[layer_idx][0][0, :, start_token:prompt_len, :].permute(1, 0, 2)
+                v_src = pkv[layer_idx][1][0, :, start_token:prompt_len, :].permute(1, 0, 2)
+
+            if pad_tokens > 0:
+                k_src = torch.nn.functional.pad(k_src, (0, 0, 0, 0, 0, pad_tokens))
+                v_src = torch.nn.functional.pad(v_src, (0, 0, 0, 0, 0, pad_tokens))
+
+            k_blocks = k_src.view(blocks_to_write, self.block_size, self.num_kv_heads, self.head_dim).to(self.dtype)
+            v_blocks = v_src.view(blocks_to_write, self.block_size, self.num_kv_heads, self.head_dim).to(self.dtype)
+
+            self.pool.k_cache[layer_idx].index_copy_(0, phys_block_ids, k_blocks)
+            self.pool.v_cache[layer_idx].index_copy_(0, phys_block_ids, v_blocks)
 
     def _compare_cached_prefill_kv(
         self,

@@ -38,7 +38,19 @@ def test_bench_serving_live_server_e2e(tmp_path: Path):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    time.sleep(2.5)
+    # Wait for server to become ready
+    deadline = time.monotonic() + 30.0
+    ready = False
+    while time.monotonic() < deadline:
+        try:
+            import urllib.request
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=1.0) as resp:
+                if resp.status == 200:
+                    ready = True
+                    break
+        except Exception:
+            time.sleep(0.5)
+    assert ready, "Server failed to start in time"
     try:
         # Generate small test trace
         trace = generate_workload_trace(num_requests=10, arrival_rate=15.0, seed=77)

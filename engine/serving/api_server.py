@@ -256,6 +256,7 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
             "total_blocks": allocator.num_blocks,
             "allocated_blocks": allocated_blocks,
             "block_size": block_size,
+            "prefix_mode": eng.scheduler.prefix_mode,
             "tokens_stored": tokens_stored,
             "bytes_per_token": bytes_per_token,
             "bytes_per_block": bytes_per_block,
@@ -328,14 +329,18 @@ def create_app(engine: Optional[AsyncEngine] = None) -> FastAPI:
         prompt_len = len(prompt_token_ids)
         total_tokens_needed = prompt_len + max_tokens
         blocks_needed = math.ceil(total_tokens_needed / block_size)
+        watermark_blocks = eng.scheduler.watermark_blocks
+        max_usable_blocks = max(1, allocator.num_blocks - watermark_blocks)
 
-        # Validate that prompt tokens + max_tokens fit the pool
-        if blocks_needed > allocator.num_blocks:
+        # Validate that prompt tokens + max_tokens fit the pool with watermark reserved
+        if blocks_needed > max_usable_blocks:
             raise HTTPException(
                 status_code=400,
                 detail=(
                     f"Prompt tokens ({prompt_len}) + max_tokens ({max_tokens}) requires "
-                    f"{blocks_needed} blocks, exceeding total pool capacity of {allocator.num_blocks} blocks."
+                    f"{blocks_needed} blocks, exceeding usable pool capacity of "
+                    f"{max_usable_blocks} blocks ({allocator.num_blocks} total minus "
+                    f"{watermark_blocks} watermark)."
                 ),
             )
 

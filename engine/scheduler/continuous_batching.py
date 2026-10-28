@@ -58,6 +58,7 @@ class Sequence:
     num_preemptions: int = 0
     total_generated_tokens: int = 0
     all_generated_ids: list[int] = field(default_factory=list)
+    initial_prompt_len: int = 0
     last_logits: Optional[Any] = None
     last_logit_margin: Optional[float] = None
     ignore_eos: bool = False
@@ -175,11 +176,13 @@ class Scheduler:
         ignore_eos: bool = False,
     ) -> Sequence:
         """Enqueues a new generation request into the waiting queue."""
+        prompt_ids = prompt_token_ids if prompt_token_ids is not None else []
         seq = Sequence(
             seq_id=next(self._id_counter),
             prompt=prompt,
             max_new_tokens=max_new_tokens,
-            prompt_token_ids=prompt_token_ids if prompt_token_ids is not None else [],
+            prompt_token_ids=prompt_ids,
+            initial_prompt_len=len(prompt_ids) if prompt_ids else len(prompt.split()),
             ignore_eos=ignore_eos,
         )
         self.waiting.append(seq)
@@ -299,12 +302,8 @@ class Scheduler:
             return
 
         for seq, tok in zip(batch.sequences, next_tokens):
-            if seq.block_table is not None:
-                if batch.batch_type == BatchType.PREFILL:
-                    kv_token_ids = seq.prompt_token_ids
-                else:
-                    kv_token_ids = seq.prompt_token_ids + seq.generated_ids
-                self._register_completed_blocks(seq, kv_token_ids)
+            if seq.block_table is not None and batch.batch_type == BatchType.PREFILL:
+                self._register_completed_blocks(seq, seq.prompt_token_ids)
 
             seq.last_token_id = tok
             seq.generated_ids.append(tok)
@@ -382,7 +381,7 @@ class Scheduler:
             # Check if candidate can never fit in pool
             if blocks_to_allocate > self.block_allocator.num_blocks:
                 self.waiting.pop(0)
-                candidate.status = SeqStatus.FINISHED
+                self.free_sequence(candidate)
                 raise MemoryError(
                     f"Sequence {candidate.seq_id} requires {blocks_to_allocate} blocks for prompt, "
                     f"exceeding total pool capacity of {self.block_allocator.num_blocks} blocks."
@@ -396,7 +395,8 @@ class Scheduler:
 
                 admitted.num_cached_tokens = len(cached_block_ids) * self.block_size
                 if not admitted.prefix_stats_recorded:
-                    self.prefix_prompt_tokens += prompt_len
+                    init_len = admitted.initial_prompt_len or prompt_len
+                    self.prefix_prompt_tokens += init_len
                     self.prefix_cached_tokens += admitted.num_cached_tokens
                     self.prefix_blocks_saved += len(cached_block_ids)
                     admitted.prefix_stats_recorded = True
@@ -474,6 +474,10 @@ class Scheduler:
                 return ScheduledBatch(batch_type=BatchType.DECODE, sequences=list(self.running))
 
         return None
+
+    def check_invariants(self) -> None:
+        """Public alias to run invariant checks."""
+        self._check_invariants()
 
     def _check_invariants(self) -> None:
         """

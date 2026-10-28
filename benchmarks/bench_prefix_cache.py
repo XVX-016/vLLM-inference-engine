@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import json
 import os
+import socket
 import subprocess
 import sys
 import time
@@ -68,6 +69,9 @@ def wait_server_ready(
     process: subprocess.Popen,
     timeout_s: float = 180.0,
     expected_blocks: int | None = None,
+    expected_prefix_mode: str | None = None,
+    expected_block_size: int | None = None,
+    expected_budget_tokens: int | None = None,
 ) -> None:
     url = f"http://127.0.0.1:{port}/health"
     deadline = time.monotonic() + timeout_s
@@ -79,16 +83,35 @@ def wait_server_ready(
             with urllib.request.urlopen(url, timeout=2.0) as response:
                 health = json.loads(response.read().decode("utf-8"))
                 if response.status == 200 and health.get("runner") == "hf":
-                    # Check capacity via /metrics if expected_blocks provided
-                    if expected_blocks is not None:
+                    # Verify configuration via /metrics
+                    if any(x is not None for x in (expected_blocks, expected_prefix_mode, expected_block_size, expected_budget_tokens)):
                         metrics_url = f"http://127.0.0.1:{port}/metrics"
                         with urllib.request.urlopen(metrics_url, timeout=2.0) as m_resp:
                             m_data = json.loads(m_resp.read().decode("utf-8"))
                             actual_blocks = m_data.get("total_blocks")
-                            if actual_blocks != expected_blocks:
+                            actual_block_size = m_data.get("block_size")
+                            actual_mode = m_data.get("prefix_mode")
+                            actual_budget = (actual_blocks or 0) * (actual_block_size or 0)
+
+                            if expected_blocks is not None and actual_blocks != expected_blocks:
                                 raise RuntimeError(
                                     f"Startup block count mismatch: server reported {actual_blocks} blocks, "
                                     f"expected capacity {expected_blocks} blocks."
+                                )
+                            if expected_prefix_mode is not None and actual_mode != expected_prefix_mode:
+                                raise RuntimeError(
+                                    f"Startup prefix_mode mismatch: server reported {actual_mode!r}, "
+                                    f"expected {expected_prefix_mode!r}."
+                                )
+                            if expected_block_size is not None and actual_block_size != expected_block_size:
+                                raise RuntimeError(
+                                    f"Startup block_size mismatch: server reported {actual_block_size}, "
+                                    f"expected {expected_block_size}."
+                                )
+                            if expected_budget_tokens is not None and actual_budget != expected_budget_tokens:
+                                raise RuntimeError(
+                                    f"Startup budget tokens mismatch: server reported {actual_budget} tokens, "
+                                    f"expected {expected_budget_tokens} tokens."
                                 )
                     return
                 raise RuntimeError(f"Unexpected paged server health response: {health!r}")
@@ -143,7 +166,14 @@ def start_paged_server(
     )
     try:
         expected_blocks = kv_budget_tokens // BLOCK_SIZE
-        wait_server_ready(port, process, expected_blocks=expected_blocks)
+        wait_server_ready(
+            port,
+            process,
+            expected_blocks=expected_blocks,
+            expected_prefix_mode=prefix_mode,
+            expected_block_size=BLOCK_SIZE,
+            expected_budget_tokens=kv_budget_tokens,
+        )
     except Exception:
         process.terminate()
         try:
@@ -156,7 +186,7 @@ def start_paged_server(
     return process, log_file, log_path
 
 
-def stop_server(process: subprocess.Popen, log_file: Any, log_path: Path) -> tuple[int, str]:
+def stop_server(process: subprocess.Popen, log_file: Any, log_path: Path, port: int = PORT) -> tuple[int, str]:
     """Terminate server; return (exit_code, last_stderr_lines)."""
     process.terminate()
     try:
@@ -166,6 +196,15 @@ def stop_server(process: subprocess.Popen, log_file: Any, log_path: Path) -> tup
         process.wait(timeout=10)
     log_file.flush()
     log_file.close()
+
+    # On Windows, wait briefly for the port to release and avoid connecting to lingering process
+    deadline = time.monotonic() + 10.0
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+                time.sleep(0.2)
+        except OSError:
+            break
 
     log_tail = ""
     try:
@@ -302,7 +341,7 @@ async def run_one(
         stop_clocks.set()
         await clock_task
         clock_samples.append(gpu_clocks())
-        _exit_code, server_stderr = stop_server(process, log_file, log_path)
+        _exit_code, server_stderr = stop_server(process, log_file, log_path, port=port)
 
     record = summarize_run(
         mode,
@@ -385,12 +424,12 @@ def build_profiles(args: argparse.Namespace) -> list[tuple[str, int, int]]:
     """Return list of (profile_name, prefix_count, system_tokens) tuples.
 
     With --trimmed-grid (default True for new runs), emit only the 5 informative
-    profiles at the trimmed λ points instead of the full 384-cell matrix.
+    profiles at the trimmed lambda points instead of the full 384-cell matrix.
     The compute-skip profile (shared_p1_s512) runs at a separate budget and rate
     set via the COMPUTE_SKIP_ constants when --compute-skip is set.
     """
     if getattr(args, "trimmed_grid", False):
-        # Trimmed grid: P=1/4/16 × S=64 + two controls
+        # Trimmed grid: P=1/4/16 x S=64 + two controls
         profiles: list[tuple[str, int, int]] = [
             (f"shared_p{p}_s64", p, 64)
             for p in (1, 4, 16)
@@ -414,6 +453,9 @@ def build_profiles(args: argparse.Namespace) -> list[tuple[str, int, int]]:
                 ("control_eviction_p64_s128", args.eviction_prefixes, 128),
             ]
         )
+    if getattr(args, "profiles", None):
+        selected = set(args.profiles)
+        profiles = [p for p in profiles if p[0] in selected]
     return profiles
 
 
@@ -459,7 +501,7 @@ def generate_plots(results: dict[str, Any], output_dir: Path) -> list[Path]:
     bar_entries = [
         entry
         for entry in results["runs"].values()
-        if entry["profile"].startswith("shared_p")
+        if "error" not in entry and "prefix_hit_rate" in entry and entry.get("profile", "").startswith("shared_p")
         and "_s64" in entry["profile"]
         and entry.get("kv_budget_tokens") == 768
     ]
@@ -496,28 +538,36 @@ async def run_compute_skip_profile(
     results_path: Path,
     trace_dir: Path,
 ) -> None:
-    """Item (5): P=1, S=512, budget=4096 tokens, λ in {0.5, 1.0}, modes share/full.
+    """Item (5): P=1, S=512, budget=4096 tokens, lambda in {0.5, 1.0}, modes share/full.
 
     At low load memory is not binding, so 'share' and 'off' should be identical
     in throughput while 'full' wins on TTFT only if compute-skipping saves
     real prefill work.  We report mean prefill_time_s and TTFT P50.
     """
-    COMPUTE_SKIP_RATES = [0.5, 1.0]
+    COMPUTE_SKIP_RATES = getattr(args, "compute_skip_rates", None) or [0.5, 1.0]
     COMPUTE_SKIP_BUDGET = 4096  # tokens
     COMPUTE_SKIP_SYSTEM_TOKENS = 512
-    COMPUTE_SKIP_MODES = ("share", "full")
+    # Include "off" as a baseline so we can confirm share≈off in throughput
+    # while full wins on TTFT when compute-skipping is effective.
+    COMPUTE_SKIP_MODES = ("off", "share", "full")
 
     profile = "compute_skip_p1_s512"
     prefix_count = 1
     system_tokens = COMPUTE_SKIP_SYSTEM_TOKENS
     budget_tokens = COMPUTE_SKIP_BUDGET
 
-    run_order_base = COMPUTE_SKIP_MODES
+    # Same 3-row Latin square as the main grid so mode order is
+    # properly counterbalanced across seed x rate cells.
+    cs_latin_square = (
+        ("off", "share", "full"),
+        ("share", "full", "off"),
+        ("full", "off", "share"),
+    )
     for rate in COMPUTE_SKIP_RATES:
         for seed in args.seeds:
             trace = generate_shared_prefix_trace(
                 tokenizer=tokenizer,
-                num_requests=args.num_requests,
+                num_requests=getattr(args, "compute_skip_requests", None) or args.num_requests,
                 arrival_rate=rate,
                 prefix_count=prefix_count,
                 system_prompt_tokens=system_tokens,
@@ -530,7 +580,8 @@ async def run_compute_skip_profile(
 
             scenario_key = f"{profile}|budget={budget_tokens}|lambda={rate:g}|seed={seed}"
             mode_results: dict[str, dict[str, Any]] = {}
-            order = run_order_base if (seed + int(rate * 2) + budget_tokens) % 2 == 0 else tuple(reversed(run_order_base))
+            order_idx = (int(rate * 2) + seed + (budget_tokens // 256)) % 3
+            order = cs_latin_square[order_idx]
             for mode in order:
                 run_key = f"{scenario_key}|mode={mode}"
                 if args.resume and run_key in results["runs"]:
@@ -622,7 +673,11 @@ async def run_matrix(args: argparse.Namespace) -> None:
                 results["trace_metadata"][trace_path.name] = trace.metadata
     save_checkpoint(results_path, results)
 
-    run_order = ("off", "share", "full")
+    latin_square_orders = (
+        ("off", "share", "full"),
+        ("share", "full", "off"),
+        ("full", "off", "share"),
+    )
     for profile, _, _ in build_profiles(args):
         for budget_tokens in args.budget_tokens:
             for rate in args.rates:
@@ -630,7 +685,8 @@ async def run_matrix(args: argparse.Namespace) -> None:
                     trace = traces[(profile, rate, seed)]
                     scenario_key = f"{profile}|budget={budget_tokens}|lambda={rate:g}|seed={seed}"
                     mode_results: dict[str, dict[str, Any]] = {}
-                    order = run_order if (seed + int(rate) + budget_tokens) % 2 == 0 else tuple(reversed(run_order))
+                    order_idx = (int(rate * 2) + seed + (budget_tokens // 256)) % 3
+                    order = latin_square_orders[order_idx]
                     for mode in order:
                         run_key = f"{scenario_key}|mode={mode}"
                         if args.resume and run_key in results["runs"]:
@@ -708,7 +764,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the shared-prefix KV-cache benchmark matrix.")
     parser.add_argument("--model-name", default="Qwen/Qwen2.5-0.5B-Instruct")
     parser.add_argument("--num-requests", type=int, default=200)
-    # Trimmed grid defaults: λ in {3,4}, budget 768 only.
+    # Trimmed grid defaults: lambda in {3,4}, budget 768 only.
     # Pass --rates 1 2 3 4 --budget-tokens 768 1536 to restore the full matrix.
     parser.add_argument("--rates", nargs="+", type=float, default=[3.0, 4.0])
     parser.add_argument("--seeds", nargs="+", type=int, default=list(DEFAULT_SEEDS))
@@ -721,15 +777,27 @@ def main() -> None:
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--trimmed-grid", action="store_true", default=True,
-        help="Only run P=1/4/16 × S=64 profiles plus controls (default: True).",
+        help="Only run P=1/4/16 x S=64 profiles plus controls (default: True).",
     )
     parser.add_argument(
         "--full-grid", dest="trimmed_grid", action="store_false",
-        help="Run the full P×S matrix (6 profiles × 2 system-token sizes).",
+        help="Run the full PxS matrix (6 profiles x 2 system-token sizes).",
+    )
+    parser.add_argument(
+        "--profiles", nargs="+", type=str, default=None,
+        help="Filter specific profiles to run (e.g. shared_p16_s64).",
     )
     parser.add_argument(
         "--compute-skip", action="store_true", default=False,
-        help="Run the compute-skipping profile: P=1, S=512, budget=4096, λ in {0.5,1.0}, modes share/full.",
+        help="Run the compute-skipping profile: P=1, S=512, budget=4096, lambda in {0.5,1.0}, modes share/full.",
+    )
+    parser.add_argument(
+        "--compute-skip-rates", nargs="+", type=float, default=None,
+        help="Override lambda values for the compute-skip profile (default: 0.5 1.0).",
+    )
+    parser.add_argument(
+        "--compute-skip-requests", type=int, default=None,
+        help="Override num-requests for compute-skip profile (default: same as --num-requests).",
     )
     args = parser.parse_args()
     asyncio.run(run_matrix(args))

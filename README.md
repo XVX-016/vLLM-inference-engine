@@ -99,26 +99,64 @@ Prefix caching invariants are enforced continuously and verified via property te
 - **Randomized State Machine**: Tested against a 4,000-operation randomized transition model across multiple seeds (`test_prefix_cache_randomized_state_machine`), exercising random allocate, register, acquire, release, lookup, and preemption cycles.
 - **Token Output Parity**: Greedy completions with `prefix_mode="full"` and `prefix_mode="share"` match `prefix_mode="off"` bit-identically except for occasional floating-point near-ties where top-1/top-2 logit margins are under $0.05$.
 
-### Empirical Ablation Results (Shared System Prompt, $S=64$, KV Budget = 768 tokens)
+### Empirical Results & Invariant Analysis (Phase 6 Matrix)
 
-The table below contrasts **`off`** (no caching), **`share`** (memory sharing only, full recompute), and **`full`** (memory sharing + prefix compute skipping):
+![Prefix Caching 4-Panel Results](benchmarks/results/prefix_cache/prefix_cache_4panel.png)
 
-| Offered Load $\lambda$ | Mode | Throughput (tok/s) | TTFT P99 (ms) | Prefix Hit Rate | Mean Concurrency | Blocks Saved |
-| :---: | :---: | :---: | :---: | :---: | :---: | :---: |
-| **$\lambda = 1.0$** | `off` | 22.3 tok/s | 1,824 ms | 0.0% | 1.55 | 0 |
-| | `share` | 22.2 tok/s | 436 ms | 65.5% | 1.16 | 929 |
-| | `full` | 22.2 tok/s | 456 ms | 65.5% | 1.16 | 929 |
-| **$\lambda = 2.0$** | `off` | 38.4 tok/s | 15,245 ms | 0.0% | 4.38 | 0 |
-| | `share` | 44.0 tok/s | 620 ms | 65.6% | 3.08 | 930 |
-| | `full` | 44.1 tok/s | 577 ms | 65.5% | 3.04 | 929 |
-| **$\lambda = 3.0$** (Saturation) | `off` | 38.9 tok/s | 44,239 ms | 0.0% | 4.53 | 0 |
-| | `share` | **65.6 tok/s** | **3,404 ms** | 65.8% | 7.70 | 933 |
-| | `full` | **65.6 tok/s** | **3,609 ms** | 65.6% | 7.91 | 930 |
+#### 1. Core Throughput & Dose-Response Scaling (768-Token Budget)
+Across all runs, **throughput gains strictly scale with prefix sharing density**, exhibiting a clear monotonic dose-response relationship:
 
-#### Insights & Findings:
-- **Memory Sharing Dominates Concurrency & Saturation Throughput**: Under the fixed 768-token budget (48 blocks), sharing a 64-token system prompt saves 4 blocks (~25%) per request. At $\lambda=3.0$, this enables mean concurrency to jump from 4.53 sequences to 7.70–7.91 sequences, lifting saturation throughput from **38.9 tok/s to 65.6 tok/s (+68.6% speedup)** and preventing massive KV starvation queues (P99 TTFT drops from 44.2 s down to 3.4 s).
-- **Compute Skipping vs Memory Sharing**: Because Qwen2.5-0.5B prefill latency on short prompts is kernel-launch bound, the throughput curves for `share` and `full` are virtually identical. The primary performance advantage of prefix caching on memory-constrained serving engines stems from **KV cache deduplication**, not skipped FLOPs.
-- **Eviction & Hit Rate Graceful Degradation**: When prefix diversity ($P$) increases beyond cache capacity, the LRU policy evicts oldest unreferenced prefix blocks smoothly without fragmentation or leaks.
+| Profile ($S=64$, Budget = 768T) | Offered Load $\lambda$ | `off` Throughput | `share` Throughput | `full` Throughput | Measured Hit Rate | Throughput Speedup |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| **P = 1** (High sharing) | $\lambda=3.0$ | 38.9 tok/s (s42) / 39.1 (s43) | 65.6 tok/s (s42) / 56.5 (s43) | 65.6 tok/s (s42) / 56.5 (s43) | **49.8%** | **1.45–1.69×** |
+| | $\lambda=4.0$ | 38.8 tok/s (s42) / 41.7 (s43) | 68.5 tok/s (s42) / 68.7 (s43) | 65.8 tok/s (s42) / 67.9 (s43) | **49.9%** | **1.63–1.77×** |
+| **P = 4** (Moderate sharing) | $\lambda=3.0$ | 36.5 tok/s (s42) / 40.0 (s43) | 55.5 tok/s (s42) / 54.1 (s43) | 55.2 tok/s (s42) / 54.6 (s43) | **48.3%** | **1.35–1.52×** |
+| | $\lambda=4.0$ | 36.7 tok/s (s42) / 36.1 (s43) | 56.6 tok/s (s42) / 54.4 (s43) | 55.0 tok/s (s42) / 57.8 (s43) | **48.4%** | **1.51–1.60×** |
+| **P = 16** (Eviction stress test) | $\lambda=3.0$ | 38.9 tok/s (s42) / 39.0 (s43) | 41.6 tok/s (s42) / 42.2 (s43) | 41.1 tok/s (s42) / 42.0 (s43) | **4.0%** | **1.06–1.08×** |
+| | $\lambda=4.0$ | 38.7 tok/s (s42) / 41.1 (s43) | 42.6 tok/s (s42) / 42.3 (s43) | 41.3 tok/s (s42) / 42.8 (s43) | **4.1%** | **1.03–1.10×** |
+| **Control** (Zero-sharing, $P=200$) | $\lambda=3.0$ | 26.7 tok/s | 28.4 tok/s | 26.0 tok/s | **0.0%** | **1.00× (Within noise)** |
+
+- **Hit-Rate Disambiguation**: For P=4, the measured hit rate is **48.3%** out of a theoretical shareable ceiling of **50.6%** ($48\text{ shared tokens} / 95\text{ avg tokens}$), achieving **95.4% cache efficiency**. For P=16 under the 768-token budget, the measured hit rate collapses to **4.0%** (**7.9% efficiency**) because 16 active prefixes require $16 \times 64 = 1,024$ tokens, exceeding the 768-token physical capacity and causing continuous LRU eviction thrashing.
+- **Zero-Sharing Control Overhead**: In the $P=200$ control (where unique prefix headers guarantee a clean 0.0% hit rate by construction), throughputs for `off`, `share`, and `full` are indistinguishable within 2-seed noise (26.7, 28.4, 26.0 tok/s), confirming zero runtime penalty when prefixes cannot be shared.
+
+#### 2. Fair Caching Scaling: P=16 at Higher Budgets
+When the pool budget is expanded to comfortably hold all 16 distinct system prompts, cache thrashing vanishes and throughput scales proportionally:
+
+| KV Budget | Mode | Throughput (tok/s) | Hit Rate | Evictions | Preemptions | TTFT P50 (s) | Speedup vs `off` |
+|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **768 Tokens** (Eviction Stress) | `off` | 38.9 tok/s | 0.0% | 0 | 23 | 24.04 s | 1.00× |
+| | `share` | 41.6 tok/s | 4.0% | 1,528 | 26 | 21.58 s | 1.07× |
+| | `full` | 41.1 tok/s | 3.7% | 1,545 | 24 | 21.37 s | 1.06× |
+| **2048 Tokens** | `off` | 45.0 tok/s | 0.0% | 0 | 8 | 7.61 s | 1.00× |
+| | `share` | 54.1 tok/s | 25.1% | 509 | 11 | 4.27 s | **1.20×** |
+| | `full` | 52.9 tok/s | 22.9% | 523 | 15 | 5.08 s | **1.18×** |
+| **4096 Tokens** (Full Residency) | `off` | 49.5 tok/s | 0.0% | 0 | 10 | 4.75 s | 1.00× |
+| | `share` | 67.1 tok/s | 49.7% | 190 | 0 | 0.57 s | **1.36×** |
+| | `full` | 66.3 tok/s | 49.8% | 186 | 0 | 0.46 s | **1.34×** |
+
+#### 3. Anatomy of the TTFT Disparity: Memory Effect vs Compute Skipping
+Under long system prefixes ($P=1, S=512$, budget = 4096 tokens, $\lambda \in \{0.5, 1.0\}$), naive execution reported massive TTFT gaps between `off` and `share`/`full`:
+- At $\lambda=0.5$: `off` TTFT P50 = **2.36–7.34 s** (up to 8 preemptions), while `share`/`full` TTFT P50 = **0.16–0.19 s** (0 preemptions).
+- At $\lambda=1.0$: `off` TTFT P50 = **69.98–83.53 s** (up to 13 preemptions), while `share`/`full` TTFT P50 = **0.16–0.17 s** (0 preemptions).
+
+**The Root Cause is Memory Sharing, Not Compute FLOPs**:
+Because each 512-token prefix occupies 32 blocks, unshared execution (`off`) quickly exhausts the 4096-token pool (which holds only 8 concurrent full-length requests), forcing severe queueing delays and repeated preemption cycles. Prefix sharing (`share`) amortizes the 32 blocks across all requests, reducing active memory consumption by over $85\%$, completely eliminating preemptions, and maintaining near-instantaneous queue clearance.
+
+**Prefill Compute-Skip Profiling**:
+In-process GPU microbenchmarking isolating raw forward math (with an isolated 481-token prefix and an 8-token suffix) demonstrates:
+- **Full prefill (489 tokens)**: $53.84\text{ ms}$ (launch-bound on RTX Laptop GPU)
+- **Suffix prefill (8 tokens, 481 cached)**: $46.31\text{ ms}$
+- **True raw compute saving**: **$7.53\text{ ms}$ ($1.16\times$ speedup)**.
+
+Because single-step forward passes at this parameter scale are launch-bound (~45–50 ms per forward step), raw prefill compute skipping saves only tens of milliseconds. The multi-second TTFT reductions observed in live serving are entirely queueing delay mitigations afforded by memory deduplication.
+
+#### 4. Hardware Telemetry & Thermal Clocks
+Logged GPU graphics clocks across all matrix runs:
+- `off` runs: Mean $1,038.9\text{ MHz}$ (median $795\text{ MHz}$, range $210–2,565\text{ MHz}$, $n=1,679$)
+- `share` runs: Mean $1,099.0\text{ MHz}$ (median $810\text{ MHz}$, range $210–2,565\text{ MHz}$, $n=1,373$)
+- `full` runs: Mean $937.0\text{ MHz}$ (median $600\text{ MHz}$, range $210–2,565\text{ MHz}$, $n=1,395$)
+
+Latin-square mode interleaving within each $(profile, \lambda, seed)$ cell successfully averaged thermal drift across modes. Minor throttling into lower P-states occurred during long saturation runs without creating systematic bias.
 
 ---
 

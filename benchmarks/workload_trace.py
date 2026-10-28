@@ -158,7 +158,10 @@ def generate_shared_prefix_trace(
 
     system_prompts: list[str] = []
     for prefix_idx in range(prefix_count):
-        candidate = generate_synthetic_prompt(
+        # When generating multiple distinct prefixes, prepend a unique tag so
+        # no two system prompts share their initial block(s).
+        tag = f"Prefix {prefix_idx:04d}: " if prefix_count > 1 else ""
+        candidate = tag + generate_synthetic_prompt(
             target_token_count=max(system_prompt_tokens * 3, 8),
             seed=seed * 1009 + prefix_idx,
         )
@@ -223,9 +226,11 @@ def generate_shared_prefix_trace(
             if any(ids[position] != token for ids in group_ids[1:]):
                 common_tokens = position
                 break
-        for ids in group_ids:
+        # The first request in the prefix group populates the cache (cold miss);
+        # only subsequent requests (len(group_ids) - 1) can hit the cached prefix blocks.
+        for ids in group_ids[1:]:
             shareable_tokens += min(
-                common_tokens,
+                (common_tokens // block_size) * block_size,
                 max(0, ((len(ids) - 1) // block_size) * block_size),
             )
 
