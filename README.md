@@ -152,6 +152,6 @@ scripts/           diagnostics (K/V equivalence, pool sizing, Triton check)
 
 ## License
 
-This project is released under the [MIT License](LICENSE). Copyright (c) 2026 [Tanmmay kanahaiya].
+This project is released under the [Apache License](LICENSE). Copyright (c) 2026 [Tanmmay kanahaiya].
 
 Third-party components (PyTorch, Hugging Face Transformers, Triton, FastAPI and others) are used under their own licenses. Qwen2.5-0.5B-Instruct model weights are distributed under their own license terms; check the model card before redistributing them or using them commercially.
